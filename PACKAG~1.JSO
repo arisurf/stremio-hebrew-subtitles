@@ -1,0 +1,15 @@
+{
+  "name": "stremio-hebrew-ai-subtitles",
+  "version": "1.0.0",
+  "description": "Stremio add-on that fetches English subtitles and translates them to Hebrew with AI (Gemini), preserving all timings",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

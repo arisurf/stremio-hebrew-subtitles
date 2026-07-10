@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: hebrew-ai-subtitles
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
