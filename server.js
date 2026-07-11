@@ -60,17 +60,23 @@ function parseSrt(raw) {
     const timing = lines[i].trim();
     const textLines = lines.slice(i + 1);
     if (textLines.length === 0) continue;
-    cues.push({ timing, text: textLines.join('\n') });
+    // Strip ASS/SSA formatting tags like {\an8} — players show them as literal text.
+    const text = textLines.join('\n').replace(/\{\\[^}]*\}/g, '').trim();
+    if (!text) continue;
+    cues.push({ timing, text });
   }
   return cues;
 }
 
+const RLM = '‏'; // right-to-left mark: keeps punctuation on the correct side in Hebrew
+
 function buildSrt(cues, texts) {
   const out = [];
   for (let i = 0; i < cues.length; i++) {
+    const text = (texts[i] || cues[i].text).trim();
     out.push(String(i + 1));
     out.push(cues[i].timing);
-    out.push((texts[i] || cues[i].text).trim());
+    out.push(text.split('\n').map((l) => RLM + l).join('\n'));
     out.push('');
   }
   return out.join('\n');
@@ -192,17 +198,30 @@ async function translateAll(cues, log) {
 // ---------------------------------------------------------------------------
 // Fetch English subtitles from Stremio's public OpenSubtitles service
 // ---------------------------------------------------------------------------
-async function fetchEnglishSrt(type, videoId) {
+const candidatesCache = new Map(); // key -> { list, at }
+
+async function getEnglishCandidates(type, videoId) {
+  const key = `${type}-${videoId}`;
+  const hit = candidatesCache.get(key);
+  if (hit && Date.now() - hit.at < 3600000) return hit.list;
   const url = `${OPENSUBS_BASE}/subtitles/${type}/${encodeURIComponent(videoId)}.json`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`OpenSubtitles lookup failed (${res.status})`);
   const data = await res.json();
   const candidates = (data.subtitles || []).filter((s) => s.lang === 'eng');
-  if (candidates.length === 0) throw new Error('No English subtitles found for this video');
   // Prefer UTF-8 encoded entries
   candidates.sort((a, b) => (b.SubEncoding === 'UTF-8') - (a.SubEncoding === 'UTF-8'));
+  candidatesCache.set(key, { list: candidates, at: Date.now() });
+  return candidates;
+}
+
+async function fetchEnglishSrt(type, videoId, variant = 0) {
+  const candidates = await getEnglishCandidates(type, videoId);
+  if (candidates.length === 0) throw new Error('No English subtitles found for this video');
+  // Start from the requested variant, then rotate through the rest as fallback.
+  const ordered = candidates.slice(variant % candidates.length).concat(candidates.slice(0, variant % candidates.length));
   let lastErr;
-  for (const cand of candidates.slice(0, 3)) {
+  for (const cand of ordered.slice(0, 3)) {
     try {
       const r = await fetch(cand.url);
       if (!r.ok) throw new Error(`download ${r.status}`);
@@ -222,15 +241,15 @@ async function fetchEnglishSrt(type, videoId) {
 // ---------------------------------------------------------------------------
 const jobs = new Map(); // cacheKey -> { status: 'working'|'error', error?, startedAt }
 
-function cacheKeyFor(type, videoId) {
-  return `${type}-${videoId}`.replace(/[^a-zA-Z0-9_-]/g, '_');
+function cacheKeyFor(type, videoId, variant = 0) {
+  return `${type}-${videoId}-v${variant}`.replace(/[^a-zA-Z0-9_-]/g, '_');
 }
 function cachePathFor(key) {
   return path.join(CACHE_DIR, `${key}.he.srt`);
 }
 
-function ensureTranslation(type, videoId) {
-  const key = cacheKeyFor(type, videoId);
+function ensureTranslation(type, videoId, variant = 0) {
+  const key = cacheKeyFor(type, videoId, variant);
   if (fs.existsSync(cachePathFor(key))) return;
   const existing = jobs.get(key);
   if (existing && existing.status === 'working') return;
@@ -241,7 +260,7 @@ function ensureTranslation(type, videoId) {
   const log = (msg) => console.log(`[${key}] ${msg}`);
   (async () => {
     log('starting translation job');
-    const cues = await fetchEnglishSrt(type, videoId);
+    const cues = await fetchEnglishSrt(type, videoId, variant);
     log(`fetched English subtitles: ${cues.length} cues`);
     const translated = await translateAll(cues, log);
     const srt = buildSrt(cues, translated);
@@ -292,31 +311,38 @@ app.get('/manifest.json', (req, res) => {
   res.json(MANIFEST);
 });
 
-function handleSubtitlesRequest(req, res) {
+async function handleSubtitlesRequest(req, res) {
   const { type, id } = req.params;
   if (!['movie', 'series'].includes(type) || !id.startsWith('tt')) {
     return res.json({ subtitles: [] });
   }
-  ensureTranslation(type, id); // kick off in background
-  const key = cacheKeyFor(type, id);
-  res.json({
-    subtitles: [
-      {
-        id: `heb-ai-${key}`,
-        url: `${baseUrl(req)}/subfile/${type}/${encodeURIComponent(id)}.srt`,
-        lang: 'heb',
-      },
-    ],
-    cacheMaxAge: 3600,
-  });
+  ensureTranslation(type, id, 0); // eagerly translate the first variant
+  // Offer up to 3 Hebrew variants (each from a different English source file)
+  // so the user can pick the one that matches their video's timing.
+  let variants = 1;
+  try {
+    variants = Math.min(3, Math.max(1, (await getEnglishCandidates(type, id)).length));
+  } catch {
+    /* fall back to a single entry */
+  }
+  const subtitles = [];
+  for (let v = 0; v < variants; v++) {
+    subtitles.push({
+      id: `heb-ai-${cacheKeyFor(type, id, v)}`,
+      url: `${baseUrl(req)}/subfile/${type}/${encodeURIComponent(id)}/v${v}.srt`,
+      lang: 'heb',
+    });
+  }
+  res.json({ subtitles, cacheMaxAge: 3600 });
 }
 
 app.get('/subtitles/:type/:id.json', handleSubtitlesRequest);
 app.get('/subtitles/:type/:id/:extra.json', handleSubtitlesRequest);
 
-app.get('/subfile/:type/:id.srt', (req, res) => {
+function handleSubfileRequest(req, res) {
   const { type, id } = req.params;
-  const key = cacheKeyFor(type, id);
+  const variant = parseInt(String(req.params.variant || '0').replace(/\D/g, ''), 10) || 0;
+  const key = cacheKeyFor(type, id, variant);
   const file = cachePathFor(key);
   res.setHeader('Content-Type', 'text/srt; charset=utf-8');
 
@@ -325,7 +351,7 @@ app.get('/subfile/:type/:id.srt', (req, res) => {
     return res.send(fs.readFileSync(file, 'utf8'));
   }
 
-  ensureTranslation(type, id);
+  ensureTranslation(type, id, variant);
   const job = jobs.get(key);
   res.setHeader('Cache-Control', 'no-store');
   if (job && job.status === 'error') {
@@ -334,7 +360,10 @@ app.get('/subfile/:type/:id.srt', (req, res) => {
   return res.send(
     placeholderSrt('התרגום לעברית בהכנה... בחרו שוב את הכתוביות בעוד כדקה | Translating to Hebrew, re-select subtitles in ~1 minute')
   );
-});
+}
+
+app.get('/subfile/:type/:id/:variant.srt', handleSubfileRequest);
+app.get('/subfile/:type/:id.srt', handleSubfileRequest);
 
 app.get('/health', (req, res) => res.send('ok'));
 
