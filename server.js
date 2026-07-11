@@ -204,23 +204,43 @@ async function translateAll(cues, log) {
 // ---------------------------------------------------------------------------
 const candidatesCache = new Map(); // key -> { list, at }
 
-async function getEnglishCandidates(type, videoId) {
-  const key = `${type}-${videoId}`;
-  const hit = candidatesCache.get(key);
-  if (hit && Date.now() - hit.at < 3600000) return hit.list;
-  const url = `${OPENSUBS_BASE}/subtitles/${type}/${encodeURIComponent(videoId)}.json`;
+async function fetchCandidateList(type, videoId, extra) {
+  const url = `${OPENSUBS_BASE}/subtitles/${type}/${encodeURIComponent(videoId)}${extra ? '/' + extra : ''}.json`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`OpenSubtitles lookup failed (${res.status})`);
   const data = await res.json();
-  const candidates = (data.subtitles || []).filter((s) => s.lang === 'eng');
-  // Prefer UTF-8 encoded entries
-  candidates.sort((a, b) => (b.SubEncoding === 'UTF-8') - (a.SubEncoding === 'UTF-8'));
+  return (data.subtitles || []).filter((s) => s.lang === 'eng');
+}
+
+async function getEnglishCandidates(type, videoId, extra = '') {
+  const key = `${type}-${videoId}-${extra}`;
+  const hit = candidatesCache.get(key);
+  if (hit && Date.now() - hit.at < 3600000) return hit.list;
+
+  // If Stremio told us the exact video file (videoHash), ask for subtitles
+  // matched to that precise file first — those are perfectly in sync.
+  let hashMatched = [];
+  if (extra && extra.includes('videoHash=')) {
+    try {
+      hashMatched = await fetchCandidateList(type, videoId, extra);
+    } catch {
+      /* fall through to the general list */
+    }
+  }
+
+  const general = await fetchCandidateList(type, videoId, '');
+  // Prefer UTF-8 encoded entries in the general list
+  general.sort((a, b) => (b.SubEncoding === 'UTF-8') - (a.SubEncoding === 'UTF-8'));
+
+  // Hash-matched files first, then the rest (deduplicated).
+  const seen = new Set(hashMatched.map((s) => s.id));
+  const candidates = hashMatched.concat(general.filter((s) => !seen.has(s.id)));
   candidatesCache.set(key, { list: candidates, at: Date.now() });
   return candidates;
 }
 
-async function fetchEnglishSrt(type, videoId, variant = 0) {
-  const candidates = await getEnglishCandidates(type, videoId);
+async function fetchEnglishSrt(type, videoId, variant = 0, extra = '') {
+  const candidates = await getEnglishCandidates(type, videoId, extra);
   if (candidates.length === 0) throw new Error('No English subtitles found for this video');
   // Start from the requested variant, then rotate through the rest as fallback.
   const ordered = candidates.slice(variant % candidates.length).concat(candidates.slice(0, variant % candidates.length));
@@ -245,15 +265,19 @@ async function fetchEnglishSrt(type, videoId, variant = 0) {
 // ---------------------------------------------------------------------------
 const jobs = new Map(); // cacheKey -> { status: 'working'|'error', error?, startedAt }
 
-function cacheKeyFor(type, videoId, variant = 0) {
-  return `${type}-${videoId}-v${variant}`.replace(/[^a-zA-Z0-9_-]/g, '_');
+function hashTag(extra) {
+  const m = /videoHash=([^&]+)/.exec(extra || '');
+  return m ? `-h${m[1].slice(0, 12)}` : '';
+}
+function cacheKeyFor(type, videoId, variant = 0, extra = '') {
+  return `${type}-${videoId}-v${variant}${hashTag(extra)}`.replace(/[^a-zA-Z0-9_-]/g, '_');
 }
 function cachePathFor(key) {
   return path.join(CACHE_DIR, `${key}.he.srt`);
 }
 
-function ensureTranslation(type, videoId, variant = 0) {
-  const key = cacheKeyFor(type, videoId, variant);
+function ensureTranslation(type, videoId, variant = 0, extra = '') {
+  const key = cacheKeyFor(type, videoId, variant, extra);
   if (fs.existsSync(cachePathFor(key))) return;
   const existing = jobs.get(key);
   if (existing && existing.status === 'working') return;
@@ -264,7 +288,7 @@ function ensureTranslation(type, videoId, variant = 0) {
   const log = (msg) => console.log(`[${key}] ${msg}`);
   (async () => {
     log('starting translation job');
-    const cues = await fetchEnglishSrt(type, videoId, variant);
+    const cues = await fetchEnglishSrt(type, videoId, variant, extra);
     log(`fetched English subtitles: ${cues.length} cues`);
     const translated = await translateAll(cues, log);
     const srt = buildSrt(cues, translated);
@@ -320,20 +344,24 @@ async function handleSubtitlesRequest(req, res) {
   if (!['movie', 'series'].includes(type) || !id.startsWith('tt')) {
     return res.json({ subtitles: [] });
   }
-  ensureTranslation(type, id, 0); // eagerly translate the first variant
+  // Stremio sends the exact video file's fingerprint (videoHash) — use it so
+  // the first Hebrew option is translated from a perfectly-synced English file.
+  const extra = req.params.extra && req.params.extra.includes('videoHash=') ? req.params.extra : '';
+  ensureTranslation(type, id, 0, extra); // eagerly translate the first variant
   // Offer up to 3 Hebrew variants (each from a different English source file)
   // so the user can pick the one that matches their video's timing.
   let variants = 1;
   try {
-    variants = Math.min(3, Math.max(1, (await getEnglishCandidates(type, id)).length));
+    variants = Math.min(3, Math.max(1, (await getEnglishCandidates(type, id, extra)).length));
   } catch {
     /* fall back to a single entry */
   }
+  const xq = extra ? `&x=${encodeURIComponent(extra)}` : '';
   const subtitles = [];
   for (let v = 0; v < variants; v++) {
     subtitles.push({
-      id: `heb-ai-${cacheKeyFor(type, id, v)}`,
-      url: `${baseUrl(req)}/subfile/${type}/${encodeURIComponent(id)}/v${v}.srt?b=2`,
+      id: `heb-ai-${cacheKeyFor(type, id, v, extra)}`,
+      url: `${baseUrl(req)}/subfile/${type}/${encodeURIComponent(id)}/v${v}.srt?b=2${xq}`,
       lang: 'heb',
     });
   }
@@ -346,7 +374,8 @@ app.get('/subtitles/:type/:id/:extra.json', handleSubtitlesRequest);
 function handleSubfileRequest(req, res) {
   const { type, id } = req.params;
   const variant = parseInt(String(req.params.variant || '0').replace(/\D/g, ''), 10) || 0;
-  const key = cacheKeyFor(type, id, variant);
+  const extra = typeof req.query.x === 'string' && req.query.x.includes('videoHash=') ? req.query.x : '';
+  const key = cacheKeyFor(type, id, variant, extra);
   const file = cachePathFor(key);
   res.setHeader('Content-Type', 'text/srt; charset=utf-8');
 
@@ -355,7 +384,7 @@ function handleSubfileRequest(req, res) {
     return res.send(fs.readFileSync(file, 'utf8'));
   }
 
-  ensureTranslation(type, id, variant);
+  ensureTranslation(type, id, variant, extra);
   const job = jobs.get(key);
   res.setHeader('Cache-Control', 'no-store');
   if (job && job.status === 'error') {
