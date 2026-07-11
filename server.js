@@ -98,7 +98,7 @@ async function geminiTranslateBatch(lines, attempt = 0) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.2, responseMimeType: 'application/json', maxOutputTokens: 16384 },
+      generationConfig: { temperature: 0.2, responseMimeType: 'application/json', maxOutputTokens: 32768 },
     }),
   });
 
@@ -112,7 +112,11 @@ async function geminiTranslateBatch(lines, attempt = 0) {
   if (!res.ok) throw new Error(`Gemini error ${res.status}: ${(await res.text()).slice(0, 200)}`);
 
   const data = await res.json();
-  const textOut = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
+  // Ignore "thought" parts emitted by thinking models — only keep real output.
+  const parts = (data?.candidates?.[0]?.content?.parts || []).filter((p) => !p.thought);
+  let textOut = parts.map((p) => p.text || '').join('').trim();
+  // Strip markdown code fences if present.
+  textOut = textOut.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
   let arr;
   try {
     arr = JSON.parse(textOut);
@@ -167,9 +171,14 @@ async function translateAll(cues, log) {
     if (GEMINI_API_KEY) {
       try {
         translated = await geminiTranslateBatch(batch);
-      } catch (e) {
-        log(`Gemini failed for batch at ${start} (${e.message}); falling back to Google Translate`);
-        translated = await googleTranslateBatch(batch);
+      } catch (e1) {
+        log(`Gemini failed for batch at ${start} (${e1.message}); retrying once`);
+        try {
+          translated = await geminiTranslateBatch(batch);
+        } catch (e2) {
+          log(`Gemini retry failed for batch at ${start} (${e2.message}); falling back to Google Translate`);
+          translated = await googleTranslateBatch(batch);
+        }
       }
     } else {
       translated = await googleTranslateBatch(batch);
