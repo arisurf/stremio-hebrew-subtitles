@@ -68,7 +68,11 @@ function parseSrt(raw) {
   return cues;
 }
 
-const RLM = '‏'; // right-to-left mark: keeps punctuation on the correct side in Hebrew
+// Wrap each line in an RTL embedding (U+202B ... U+202C) so punctuation at
+// BOTH ends of the line renders on the correct side in Hebrew, even in
+// players that lay subtitles out left-to-right.
+const RLE = '‫';
+const PDF = '‬';
 
 function buildSrt(cues, texts) {
   const out = [];
@@ -76,7 +80,7 @@ function buildSrt(cues, texts) {
     const text = (texts[i] || cues[i].text).trim();
     out.push(String(i + 1));
     out.push(cues[i].timing);
-    out.push(text.split('\n').map((l) => RLM + l).join('\n'));
+    out.push(text.split('\n').map((l) => RLE + l.trim() + PDF).join('\n'));
     out.push('');
   }
   return out.join('\n');
@@ -329,7 +333,7 @@ async function handleSubtitlesRequest(req, res) {
   for (let v = 0; v < variants; v++) {
     subtitles.push({
       id: `heb-ai-${cacheKeyFor(type, id, v)}`,
-      url: `${baseUrl(req)}/subfile/${type}/${encodeURIComponent(id)}/v${v}.srt`,
+      url: `${baseUrl(req)}/subfile/${type}/${encodeURIComponent(id)}/v${v}.srt?b=2`,
       lang: 'heb',
     });
   }
