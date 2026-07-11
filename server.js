@@ -19,10 +19,10 @@ const path = require('path');
 
 const PORT = process.env.PORT || 7000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-flash-latest';
 const OPENSUBS_BASE = 'https://opensubtitles-v3.strem.io';
 const CACHE_DIR = process.env.CACHE_DIR || '/tmp/hebsub-cache';
-const BATCH_SIZE = 80; // subtitle cues per Gemini request
+const BATCH_SIZE = 50; // subtitle cues per Gemini request
 
 fs.mkdirSync(CACHE_DIR, { recursive: true });
 
@@ -98,7 +98,7 @@ async function geminiTranslateBatch(lines, attempt = 0) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.2, responseMimeType: 'application/json' },
+      generationConfig: { temperature: 0.2, responseMimeType: 'application/json', maxOutputTokens: 16384 },
     }),
   });
 
@@ -124,7 +124,15 @@ async function geminiTranslateBatch(lines, attempt = 0) {
   if (!Array.isArray(arr) || arr.length !== lines.length) {
     throw new Error(`Gemini returned ${Array.isArray(arr) ? arr.length : 'invalid'} items, expected ${lines.length}`);
   }
-  return arr.map((s) => String(s));
+  const out = arr.map((s) => String(s));
+  // Sanity check: the output must actually be Hebrew. If the model echoed the
+  // English input (or answered in another language), treat it as a failure so
+  // the caller falls back to Google Translate for this batch.
+  const hebrewCount = out.filter((s) => /[֐-׿]/.test(s)).length;
+  if (hebrewCount < out.length * 0.4) {
+    throw new Error(`Gemini output not in Hebrew (${hebrewCount}/${out.length} lines contain Hebrew)`);
+  }
+  return out;
 }
 
 async function googleTranslateLine(line) {
