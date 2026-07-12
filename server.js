@@ -31,8 +31,8 @@ fs.mkdirSync(CACHE_DIR, { recursive: true });
 // ---------------------------------------------------------------------------
 const MANIFEST = {
   id: 'org.ari.hebrew.ai.subtitles',
-  version: '1.0.0',
-  name: 'Hebrew AI Subtitles',
+  version: '1.1.0',
+  name: 'Ari4KD Hebrew AI Subtitles',
   description:
     'כתוביות בעברית לכל סרט וסדרה: מוריד כתוביות באנגלית ומתרגם אותן לעברית עם AI, כולל שמירה מדויקת על התזמון. ' +
     'Fetches English subtitles and translates them to Hebrew with AI, preserving exact timing.',
@@ -299,7 +299,7 @@ async function fetchEnglishSrt(type, videoId, variant = 0, extra = '') {
       const srt = await r.text();
       const cues = parseSrt(srt);
       if (cues.length < 5) throw new Error('subtitle file looks empty/corrupt');
-      return cues;
+      return { cues, cand };
     } catch (e) {
       lastErr = e;
     }
@@ -335,9 +335,14 @@ function ensureTranslation(type, videoId, variant = 0, extra = '') {
   const log = (msg) => console.log(`[${key}] ${msg}`);
   (async () => {
     log('starting translation job');
-    const cues = await fetchEnglishSrt(type, videoId, variant, extra);
+    const { cues, cand } = await fetchEnglishSrt(type, videoId, variant, extra);
     log(`fetched English subtitles: ${cues.length} cues`);
     const translated = await translateAll(cues, log);
+    // Identification cue: shown during the first seconds of playback so the
+    // user knows which variant they picked and whether it is file-verified.
+    const idLabel = `Ari4KD · גרסה ${variant + 1}${cand && cand.hashMatch ? ' · ✓ מסונכרן לקובץ' : ''}`;
+    cues.unshift({ timing: '00:00:00,500 --> 00:00:05,000', text: idLabel });
+    translated.unshift(idLabel);
     const srt = buildSrt(cues, translated);
     fs.writeFileSync(cachePathFor(key), srt, 'utf8');
     jobs.delete(key);
@@ -405,32 +410,22 @@ async function handleSubtitlesRequest(req, res) {
   try {
     cands = (await getEnglishCandidates(type, id, extra)).slice(0, 3);
   } catch {
-    /* fall back to a single unlabeled entry */
+    /* fall back to a single entry */
   }
   const variants = Math.max(1, cands.length);
-  const sigs = await Promise.all(cands.map((c) => timingSignature(c)));
 
+  // All entries use lang "heb" so they group under the Hebrew language
+  // category in Stremio (per-variant custom labels are not supported by the
+  // subtitles object — only id/url/lang). Each file identifies itself with an
+  // "Ari4KD · גרסה N" cue during the first seconds of playback, including a
+  // "✓ מסונכרן לקובץ" marker when it was matched to the exact video file.
   const xq = extra ? `&x=${encodeURIComponent(extra)}` : '';
   const subtitles = [];
   for (let v = 0; v < variants; v++) {
-    const cand = cands[v];
-    const sig = sigs[v];
-    const crossValidated =
-      sig && sigs.some((o, j) => j !== v && o && Math.abs(o.first - sig.first) <= 3 && Math.abs(o.last - sig.last) <= 3);
-    let label;
-    if (cand && cand.hashMatch) {
-      label = `Ari4KD ✓ מסונכרן${sig ? ` · ${formatSeconds(sig.last)}` : ''}`;
-    } else if (cand && crossValidated) {
-      label = `Ari4KD ✓ עברית ${v + 1}${sig ? ` · ${formatSeconds(sig.last)}` : ''}`;
-    } else if (cand) {
-      label = `עברית ${v + 1}${sig ? ` · ${formatSeconds(sig.last)}` : ''}`;
-    } else {
-      label = 'heb';
-    }
     subtitles.push({
       id: `heb-ai-${cacheKeyFor(type, id, v, extra)}`,
-      url: `${baseUrl(req)}/subfile/${type}/${encodeURIComponent(id)}/v${v}.srt?b=2${xq}`,
-      lang: label,
+      url: `${baseUrl(req)}/subfile/${type}/${encodeURIComponent(id)}/v${v}.srt?b=3${xq}`,
+      lang: 'heb',
     });
   }
   res.json({ subtitles, cacheMaxAge: 3600 });
