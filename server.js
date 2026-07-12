@@ -223,6 +223,7 @@ async function getEnglishCandidates(type, videoId, extra = '') {
   if (extra && extra.includes('videoHash=')) {
     try {
       hashMatched = await fetchCandidateList(type, videoId, extra);
+      hashMatched.forEach((s) => { s.hashMatch = true; });
     } catch {
       /* fall through to the general list */
     }
@@ -237,6 +238,52 @@ async function getEnglishCandidates(type, videoId, extra = '') {
   const candidates = hashMatched.concat(general.filter((s) => !seen.has(s.id)));
   candidatesCache.set(key, { list: candidates, at: Date.now() });
   return candidates;
+}
+
+// ---------------------------------------------------------------------------
+// Timing signatures: probe each English source to learn when its subtitles
+// end, so the user can match a variant against the episode's runtime, and so
+// variants that agree with each other can be marked as cross-validated.
+// ---------------------------------------------------------------------------
+const sigCache = new Map(); // candidate id -> { sig: {first,last}|null, at }
+
+function timeToSeconds(t) {
+  const m = /(\d+):(\d+):(\d+)[,.](\d+)/.exec(t);
+  if (!m) return null;
+  return +m[1] * 3600 + +m[2] * 60 + +m[3];
+}
+
+function formatSeconds(sec) {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  const mm = String(m).padStart(2, '0');
+  const ss = String(s).padStart(2, '0');
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+async function timingSignature(cand) {
+  const hit = sigCache.get(cand.id);
+  if (hit && Date.now() - hit.at < 3600000) return hit.sig;
+  let sig = null;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    const r = await fetch(cand.url, { signal: controller.signal });
+    clearTimeout(timer);
+    if (r.ok) {
+      const cues = parseSrt(await r.text());
+      if (cues.length >= 5) {
+        const first = timeToSeconds(cues[0].timing.split('-->')[0]);
+        const last = timeToSeconds(cues[cues.length - 1].timing.split('-->')[1] || cues[cues.length - 1].timing);
+        if (first != null && last != null) sig = { first, last };
+      }
+    }
+  } catch {
+    /* signature unavailable — label will omit the time */
+  }
+  sigCache.set(cand.id, { sig, at: Date.now() });
+  return sig;
 }
 
 async function fetchEnglishSrt(type, videoId, variant = 0, extra = '') {
@@ -348,21 +395,42 @@ async function handleSubtitlesRequest(req, res) {
   // the first Hebrew option is translated from a perfectly-synced English file.
   const extra = req.params.extra && req.params.extra.includes('videoHash=') ? req.params.extra : '';
   ensureTranslation(type, id, 0, extra); // eagerly translate the first variant
-  // Offer up to 3 Hebrew variants (each from a different English source file)
-  // so the user can pick the one that matches their video's timing.
-  let variants = 1;
+
+  // Offer up to 3 Hebrew variants (each from a different English source file),
+  // labeled with a timing validation so the user can pick the right one:
+  //  - "מסונכרן" = matched to the exact video file by fingerprint (certain)
+  //  - the end-time (e.g. 23:20) = compare with the episode length in the player
+  //  - "✓" = at least two independent sources agree on this timing
+  let cands = [];
   try {
-    variants = Math.min(3, Math.max(1, (await getEnglishCandidates(type, id, extra)).length));
+    cands = (await getEnglishCandidates(type, id, extra)).slice(0, 3);
   } catch {
-    /* fall back to a single entry */
+    /* fall back to a single unlabeled entry */
   }
+  const variants = Math.max(1, cands.length);
+  const sigs = await Promise.all(cands.map((c) => timingSignature(c)));
+
   const xq = extra ? `&x=${encodeURIComponent(extra)}` : '';
   const subtitles = [];
   for (let v = 0; v < variants; v++) {
+    const cand = cands[v];
+    const sig = sigs[v];
+    const crossValidated =
+      sig && sigs.some((o, j) => j !== v && o && Math.abs(o.first - sig.first) <= 3 && Math.abs(o.last - sig.last) <= 3);
+    let label;
+    if (cand && cand.hashMatch) {
+      label = `Ari4KD ✓ מסונכרן${sig ? ` · ${formatSeconds(sig.last)}` : ''}`;
+    } else if (cand && crossValidated) {
+      label = `Ari4KD ✓ עברית ${v + 1}${sig ? ` · ${formatSeconds(sig.last)}` : ''}`;
+    } else if (cand) {
+      label = `עברית ${v + 1}${sig ? ` · ${formatSeconds(sig.last)}` : ''}`;
+    } else {
+      label = 'heb';
+    }
     subtitles.push({
       id: `heb-ai-${cacheKeyFor(type, id, v, extra)}`,
       url: `${baseUrl(req)}/subfile/${type}/${encodeURIComponent(id)}/v${v}.srt?b=2${xq}`,
-      lang: 'heb',
+      lang: label,
     });
   }
   res.json({ subtitles, cacheMaxAge: 3600 });
