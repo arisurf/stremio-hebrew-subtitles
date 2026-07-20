@@ -327,6 +327,79 @@ function rememberedExtra(type, videoId) {
   return stored && Date.now() - stored.at < LAST_EXTRA_TTL ? stored.extra : '';
 }
 
+// Fingerprints must survive instance restarts (Render free churns instances
+// constantly, and the player's request often lands on a freshly-woken server
+// whose memory is empty — which served generic, unsynced files).
+let extrasLoaded = false;
+async function loadExtrasFromRemote() {
+  if (!GITHUB_TOKEN || extrasLoaded) return;
+  extrasLoaded = true;
+  try {
+    const r = await fetch(`https://api.github.com/repos/${CACHE_REPO}/contents/cache/extras.json`, {
+      headers: { ...ghHeaders(), Accept: 'application/vnd.github.raw' },
+    });
+    if (!r.ok) return;
+    const obj = JSON.parse(await r.text());
+    for (const [k, v] of Object.entries(obj)) if (!lastExtra.has(k)) lastExtra.set(k, v);
+    console.log(`[cache] loaded ${Object.keys(obj).length} fingerprints from GitHub`);
+  } catch {
+    /* non-fatal */
+  }
+}
+
+let extrasSaveTimer = null;
+function saveExtrasSoon() {
+  if (!GITHUB_TOKEN) return;
+  clearTimeout(extrasSaveTimer);
+  extrasSaveTimer = setTimeout(async () => {
+    try {
+      const fresh = {};
+      for (const [k, v] of lastExtra) if (Date.now() - v.at < LAST_EXTRA_TTL) fresh[k] = v;
+      const apiUrl = `https://api.github.com/repos/${CACHE_REPO}/contents/cache/extras.json`;
+      let sha;
+      const g = await fetch(apiUrl, { headers: ghHeaders() });
+      if (g.ok) sha = (await g.json()).sha;
+      await fetch(apiUrl, {
+        method: 'PUT',
+        headers: ghHeaders(),
+        body: JSON.stringify({
+          message: 'cache: fingerprints',
+          content: Buffer.from(JSON.stringify(fresh), 'utf8').toString('base64'),
+          ...(sha ? { sha } : {}),
+        }),
+      });
+      console.log('[cache] fingerprints saved to GitHub');
+    } catch (e) {
+      console.log(`[cache] fingerprints save error: ${e.message}`);
+    }
+  }, 3000);
+}
+
+// Let a hash-less subtitles request briefly wait for the fingerprint request
+// that usually arrives a few seconds later, so its URLs are already correct.
+const extraWaiters = new Map(); // key -> array of resolve callbacks
+function waitForExtra(key, ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      const arr = extraWaiters.get(key) || [];
+      const i = arr.indexOf(cb);
+      if (i >= 0) arr.splice(i, 1);
+      resolve('');
+    }, ms);
+    const cb = (extra) => {
+      clearTimeout(timer);
+      resolve(extra);
+    };
+    const arr = extraWaiters.get(key) || [];
+    arr.push(cb);
+    extraWaiters.set(key, arr);
+  });
+}
+function notifyExtra(key, extra) {
+  (extraWaiters.get(key) || []).forEach((cb) => cb(extra));
+  extraWaiters.delete(key);
+}
+
 function hashTag(extra) {
   const m = /videoHash=([^&]+)/.exec(extra || '');
   return m ? `-h${m[1].slice(0, 12)}` : '';
@@ -473,11 +546,17 @@ async function handleSubtitlesRequest(req, res) {
   }
   // Stremio sends the exact video file's fingerprint (videoHash) — use it so
   // the first Hebrew option is translated from a perfectly-synced English file.
+  await loadExtrasFromRemote();
   let extra = req.params.extra && req.params.extra.includes('videoHash=') ? req.params.extra : '';
+  const exKey = `${type}-${id}`;
   if (extra) {
-    lastExtra.set(`${type}-${id}`, { extra, at: Date.now() });
+    lastExtra.set(exKey, { extra, at: Date.now() });
+    saveExtrasSoon();
+    notifyExtra(exKey, extra);
   } else {
     extra = rememberedExtra(type, id); // hash arrived on an earlier request
+    if (!extra) extra = await waitForExtra(exKey, 8000); // it usually arrives seconds later
+    if (!extra) extra = rememberedExtra(type, id);
   }
   // Only translate eagerly once the fingerprint is known — translating the
   // hash-less request that arrives first produced unsynced "variant 1" files.
@@ -520,8 +599,10 @@ app.get('/subtitles/:type/:id/:extra.json', handleSubtitlesRequest);
 async function handleSubfileRequest(req, res) {
   const { type, id } = req.params;
   const variant = parseInt(String(req.params.variant || '0').replace(/\D/g, ''), 10) || 0;
+  await loadExtrasFromRemote();
   let extra = typeof req.query.x === 'string' && req.query.x.includes('videoHash=') ? req.query.x : '';
   if (!extra) extra = rememberedExtra(type, id); // fall back to the remembered fingerprint
+  if (!extra) extra = await waitForExtra(`${type}-${id}`, 5000); // fingerprint may arrive any second
   const key = cacheKeyFor(type, id, variant, extra);
   const file = cachePathFor(key);
   res.setHeader('Content-Type', 'text/srt; charset=utf-8');
