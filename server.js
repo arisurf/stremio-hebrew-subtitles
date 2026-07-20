@@ -20,6 +20,10 @@ const path = require('path');
 const PORT = process.env.PORT || 7000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-flash-latest';
+// Optional persistent cache: completed translations are committed to a GitHub
+// repo so they survive server restarts/redeploys (Render free disk is wiped).
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
+const CACHE_REPO = process.env.CACHE_REPO || 'arisurf/stremio-hebrew-subtitles';
 const OPENSUBS_BASE = 'https://opensubtitles-v3.strem.io';
 const CACHE_DIR = process.env.CACHE_DIR || '/tmp/hebsub-cache';
 const BATCH_SIZE = 50; // subtitle cues per Gemini request
@@ -334,6 +338,55 @@ function cachePathFor(key) {
   return path.join(CACHE_DIR, `${key}.he.srt`);
 }
 
+// --- Persistent cache on GitHub (survives restarts and redeploys) ---------
+function ghHeaders() {
+  return {
+    Authorization: `Bearer ${GITHUB_TOKEN}`,
+    'User-Agent': 'ari4kd-hebrew-subs',
+    Accept: 'application/vnd.github+json',
+  };
+}
+
+async function loadFromRemoteCache(key) {
+  if (!GITHUB_TOKEN) return null;
+  try {
+    const r = await fetch(
+      `https://api.github.com/repos/${CACHE_REPO}/contents/cache/${key}.he.srt`,
+      { headers: { ...ghHeaders(), Accept: 'application/vnd.github.raw' } }
+    );
+    if (!r.ok) return null;
+    const text = await r.text();
+    if (text.length < 100) return null;
+    fs.writeFileSync(cachePathFor(key), text, 'utf8');
+    console.log(`[cache] loaded ${key} from GitHub`);
+    return text;
+  } catch {
+    return null;
+  }
+}
+
+async function saveToRemoteCache(key, content) {
+  if (!GITHUB_TOKEN) return;
+  try {
+    const apiUrl = `https://api.github.com/repos/${CACHE_REPO}/contents/cache/${key}.he.srt`;
+    let sha;
+    const g = await fetch(apiUrl, { headers: ghHeaders() });
+    if (g.ok) sha = (await g.json()).sha;
+    const res = await fetch(apiUrl, {
+      method: 'PUT',
+      headers: ghHeaders(),
+      body: JSON.stringify({
+        message: `cache: ${key}`,
+        content: Buffer.from(content, 'utf8').toString('base64'),
+        ...(sha ? { sha } : {}),
+      }),
+    });
+    console.log(res.ok ? `[cache] saved ${key} to GitHub` : `[cache] GitHub save failed (${res.status})`);
+  } catch (e) {
+    console.log(`[cache] GitHub save error: ${e.message}`);
+  }
+}
+
 function ensureTranslation(type, videoId, variant = 0, extra = '') {
   const key = cacheKeyFor(type, videoId, variant, extra);
   if (fs.existsSync(cachePathFor(key))) return;
@@ -345,6 +398,11 @@ function ensureTranslation(type, videoId, variant = 0, extra = '') {
   jobs.set(key, { status: 'working', startedAt: Date.now() });
   const log = (msg) => console.log(`[${key}] ${msg}`);
   (async () => {
+    // If a previous instance already translated this, reuse it from GitHub.
+    if (await loadFromRemoteCache(key)) {
+      jobs.delete(key);
+      return;
+    }
     log('starting translation job');
     const { cues, cand } = await fetchEnglishSrt(type, videoId, variant, extra);
     log(`fetched English subtitles: ${cues.length} cues`);
@@ -358,6 +416,7 @@ function ensureTranslation(type, videoId, variant = 0, extra = '') {
     fs.writeFileSync(cachePathFor(key), srt, 'utf8');
     jobs.delete(key);
     log('done — Hebrew subtitles cached');
+    await saveToRemoteCache(key, srt); // persist across restarts/redeploys
   })().catch((e) => {
     console.error(`[${key}] FAILED: ${e.message}`);
     jobs.set(key, { status: 'error', error: e.message, startedAt: Date.now() });
@@ -420,7 +479,10 @@ async function handleSubtitlesRequest(req, res) {
   } else {
     extra = rememberedExtra(type, id); // hash arrived on an earlier request
   }
-  ensureTranslation(type, id, 0, extra); // eagerly translate the first variant
+  // Only translate eagerly once the fingerprint is known — translating the
+  // hash-less request that arrives first produced unsynced "variant 1" files.
+  // Without a fingerprint, translation starts when the user selects the sub.
+  if (extra) ensureTranslation(type, id, 0, extra);
 
   // Offer up to 3 Hebrew variants (each from a different English source file),
   // labeled with a timing validation so the user can pick the right one:
@@ -455,7 +517,7 @@ async function handleSubtitlesRequest(req, res) {
 app.get('/subtitles/:type/:id.json', handleSubtitlesRequest);
 app.get('/subtitles/:type/:id/:extra.json', handleSubtitlesRequest);
 
-function handleSubfileRequest(req, res) {
+async function handleSubfileRequest(req, res) {
   const { type, id } = req.params;
   const variant = parseInt(String(req.params.variant || '0').replace(/\D/g, ''), 10) || 0;
   let extra = typeof req.query.x === 'string' && req.query.x.includes('videoHash=') ? req.query.x : '';
@@ -464,9 +526,18 @@ function handleSubfileRequest(req, res) {
   const file = cachePathFor(key);
   res.setHeader('Content-Type', 'text/srt; charset=utf-8');
 
+  // Short client cache so a re-selected variant picks up corrected files
+  // (e.g. right after the fingerprint registers) instead of a stale copy.
   if (fs.existsSync(file)) {
-    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('Cache-Control', 'public, max-age=300');
     return res.send(fs.readFileSync(file, 'utf8'));
+  }
+
+  // Not on local disk — maybe a previous server instance translated it.
+  const remote = await loadFromRemoteCache(key);
+  if (remote) {
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    return res.send(remote);
   }
 
   ensureTranslation(type, id, variant, extra);
