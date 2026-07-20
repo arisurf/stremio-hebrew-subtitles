@@ -229,9 +229,9 @@ async function getEnglishCandidates(type, videoId, extra = '') {
     }
   }
 
+  // Keep the upstream order — the service already ranks the best-matched
+  // release first, and re-sorting was overriding that ranking.
   const general = await fetchCandidateList(type, videoId, '');
-  // Prefer UTF-8 encoded entries in the general list
-  general.sort((a, b) => (b.SubEncoding === 'UTF-8') - (a.SubEncoding === 'UTF-8'));
 
   // Hash-matched files first, then the rest (deduplicated).
   const seen = new Set(hashMatched.map((s) => s.id));
@@ -379,6 +379,11 @@ const app = express();
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', '*');
+  // Diagnostic: log every subtitle request so we can see exactly what
+  // Stremio sends (videoHash / videoSize / filename presence).
+  if (req.path.startsWith('/subtitles/') || req.path.startsWith('/subfile/')) {
+    console.log(`[request] ${req.originalUrl}`);
+  }
   next();
 });
 
