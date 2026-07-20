@@ -219,7 +219,7 @@ async function fetchCandidateList(type, videoId, extra) {
 async function getEnglishCandidates(type, videoId, extra = '') {
   const key = `${type}-${videoId}-${extra}`;
   const hit = candidatesCache.get(key);
-  if (hit && Date.now() - hit.at < 3600000) return hit.list;
+  if (hit && Date.now() - hit.at < 3600000) return applySticky(type, videoId, hit.list);
 
   // If Stremio told us the exact video file (videoHash), ask for subtitles
   // matched to that precise file first — those are perfectly in sync.
@@ -241,7 +241,7 @@ async function getEnglishCandidates(type, videoId, extra = '') {
   const seen = new Set(hashMatched.map((s) => s.id));
   const candidates = hashMatched.concat(general.filter((s) => !seen.has(s.id)));
   candidatesCache.set(key, { list: candidates, at: Date.now() });
-  return candidates;
+  return applySticky(type, videoId, candidates);
 }
 
 // ---------------------------------------------------------------------------
@@ -400,12 +400,82 @@ function notifyExtra(key, extra) {
   extraWaiters.delete(key);
 }
 
+// --- Sticky source per series -----------------------------------------------
+// When the user manually picks a variant other than the first, remember WHICH
+// source file worked for this series and put it first from then on. The
+// fingerprint associations on OpenSubtitles are unreliable for anime releases,
+// but the user's own choice is ground truth.
+const stickyChoice = new Map(); // `${type}-${imdbBase}` -> { id, at }
+const STICKY_TTL = 90 * 24 * 3600000;
+
+function stickyKeyFor(type, videoId) {
+  return `${type}-${String(videoId).split(':')[0]}`;
+}
+function stickyIdFor(type, videoId) {
+  const s = stickyChoice.get(stickyKeyFor(type, videoId));
+  return s && Date.now() - s.at < STICKY_TTL ? s.id : '';
+}
+function applySticky(type, videoId, list) {
+  const sid = stickyIdFor(type, videoId);
+  if (!sid) return list;
+  const i = list.findIndex((c) => c.id === sid);
+  if (i <= 0) return list;
+  const out = list.slice();
+  const [pick] = out.splice(i, 1);
+  out.unshift(pick);
+  return out;
+}
+
+let stickyLoaded = false;
+async function loadStickyFromRemote() {
+  if (!GITHUB_TOKEN || stickyLoaded) return;
+  stickyLoaded = true;
+  try {
+    const r = await fetch(`https://api.github.com/repos/${CACHE_REPO}/contents/cache/sticky.json`, {
+      headers: { ...ghHeaders(), Accept: 'application/vnd.github.raw' },
+    });
+    if (!r.ok) return;
+    const obj = JSON.parse(await r.text());
+    for (const [k, v] of Object.entries(obj)) if (!stickyChoice.has(k)) stickyChoice.set(k, v);
+    console.log(`[cache] loaded ${Object.keys(obj).length} sticky choices from GitHub`);
+  } catch {
+    /* non-fatal */
+  }
+}
+
+let stickySaveTimer = null;
+function saveStickySoon() {
+  if (!GITHUB_TOKEN) return;
+  clearTimeout(stickySaveTimer);
+  stickySaveTimer = setTimeout(async () => {
+    try {
+      const apiUrl = `https://api.github.com/repos/${CACHE_REPO}/contents/cache/sticky.json`;
+      let sha;
+      const g = await fetch(apiUrl, { headers: ghHeaders() });
+      if (g.ok) sha = (await g.json()).sha;
+      await fetch(apiUrl, {
+        method: 'PUT',
+        headers: ghHeaders(),
+        body: JSON.stringify({
+          message: 'cache: sticky choices',
+          content: Buffer.from(JSON.stringify(Object.fromEntries(stickyChoice)), 'utf8').toString('base64'),
+          ...(sha ? { sha } : {}),
+        }),
+      });
+      console.log('[cache] sticky choices saved to GitHub');
+    } catch (e) {
+      console.log(`[cache] sticky save error: ${e.message}`);
+    }
+  }, 3000);
+}
+
 function hashTag(extra) {
   const m = /videoHash=([^&]+)/.exec(extra || '');
   return m ? `-h${m[1].slice(0, 12)}` : '';
 }
 function cacheKeyFor(type, videoId, variant = 0, extra = '') {
-  return `${type}-${videoId}-v${variant}${hashTag(extra)}`.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const sid = stickyIdFor(type, videoId);
+  return `${type}-${videoId}-v${variant}${hashTag(extra)}${sid ? '-p' + String(sid).slice(0, 8) : ''}`.replace(/[^a-zA-Z0-9_-]/g, '_');
 }
 function cachePathFor(key) {
   return path.join(CACHE_DIR, `${key}.he.srt`);
@@ -547,6 +617,7 @@ async function handleSubtitlesRequest(req, res) {
   // Stremio sends the exact video file's fingerprint (videoHash) — use it so
   // the first Hebrew option is translated from a perfectly-synced English file.
   await loadExtrasFromRemote();
+  await loadStickyFromRemote();
   let extra = req.params.extra && req.params.extra.includes('videoHash=') ? req.params.extra : '';
   const exKey = `${type}-${id}`;
   if (extra) {
@@ -586,7 +657,7 @@ async function handleSubtitlesRequest(req, res) {
   for (let v = 0; v < variants; v++) {
     subtitles.push({
       id: `heb-ai-${cacheKeyFor(type, id, v, extra)}`,
-      url: `${baseUrl(req)}/subfile/${type}/${encodeURIComponent(id)}/v${v}.srt?b=4${xq}`,
+      url: `${baseUrl(req)}/subfile/${type}/${encodeURIComponent(id)}/v${v}.srt?b=5${xq}`,
       lang: 'heb',
     });
   }
@@ -600,9 +671,25 @@ async function handleSubfileRequest(req, res) {
   const { type, id } = req.params;
   const variant = parseInt(String(req.params.variant || '0').replace(/\D/g, ''), 10) || 0;
   await loadExtrasFromRemote();
+  await loadStickyFromRemote();
   let extra = typeof req.query.x === 'string' && req.query.x.includes('videoHash=') ? req.query.x : '';
   if (!extra) extra = rememberedExtra(type, id); // fall back to the remembered fingerprint
   if (!extra) extra = await waitForExtra(`${type}-${id}`, 5000); // fingerprint may arrive any second
+
+  // Picking a non-first variant is a deliberate user choice: remember which
+  // SOURCE that is and put it first for every future episode of this series.
+  if (variant > 0) {
+    getEnglishCandidates(type, id, extra)
+      .then((list) => {
+        const cand = list[variant];
+        if (cand && stickyIdFor(type, id) !== cand.id) {
+          stickyChoice.set(stickyKeyFor(type, id), { id: cand.id, at: Date.now() });
+          saveStickySoon();
+          console.log(`[sticky] ${stickyKeyFor(type, id)} -> source ${cand.id} (was variant ${variant + 1})`);
+        }
+      })
+      .catch(() => {});
+  }
   const key = cacheKeyFor(type, id, variant, extra);
   const file = cachePathFor(key);
   res.setHeader('Content-Type', 'text/srt; charset=utf-8');
