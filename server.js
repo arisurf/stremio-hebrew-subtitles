@@ -530,8 +530,26 @@ async function saveToRemoteCache(key, content) {
   }
 }
 
-function ensureTranslation(type, videoId, variant = 0, extra = '') {
-  const key = cacheKeyFor(type, videoId, variant, extra);
+// Cache is keyed by the SOURCE English subtitle id whenever possible: the
+// translated content depends only on the source file, so every path that
+// resolves to the same source (any variant, fingerprint, or preference)
+// reuses the same translation instead of re-translating.
+function srcKeyFor(candId) {
+  return `src-${candId}`.replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+async function resolveKey(type, videoId, variant, extra) {
+  try {
+    const list = await getEnglishCandidates(type, videoId, extra);
+    if (list[variant]) return srcKeyFor(list[variant].id);
+  } catch {
+    /* fall back to the positional key */
+  }
+  return cacheKeyFor(type, videoId, variant, extra);
+}
+
+function ensureTranslation(type, videoId, variant = 0, extra = '', key = '') {
+  if (!key) key = cacheKeyFor(type, videoId, variant, extra);
   if (fs.existsSync(cachePathFor(key))) return;
   const existing = jobs.get(key);
   if (existing && existing.status === 'working') return;
@@ -632,7 +650,9 @@ async function handleSubtitlesRequest(req, res) {
   // Only translate eagerly once the fingerprint is known — translating the
   // hash-less request that arrives first produced unsynced "variant 1" files.
   // Without a fingerprint, translation starts when the user selects the sub.
-  if (extra) ensureTranslation(type, id, 0, extra);
+  if (extra) {
+    resolveKey(type, id, 0, extra).then((k) => ensureTranslation(type, id, 0, extra, k));
+  }
 
   // Offer up to 3 Hebrew variants (each from a different English source file),
   // labeled with a timing validation so the user can pick the right one:
@@ -690,7 +710,7 @@ async function handleSubfileRequest(req, res) {
       })
       .catch(() => {});
   }
-  const key = cacheKeyFor(type, id, variant, extra);
+  const key = await resolveKey(type, id, variant, extra);
   const file = cachePathFor(key);
   res.setHeader('Content-Type', 'text/srt; charset=utf-8');
 
@@ -708,7 +728,7 @@ async function handleSubfileRequest(req, res) {
     return res.send(remote);
   }
 
-  ensureTranslation(type, id, variant, extra);
+  ensureTranslation(type, id, variant, extra, key);
   const job = jobs.get(key);
   res.setHeader('Cache-Control', 'no-store');
   if (job && job.status === 'error') {
