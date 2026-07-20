@@ -311,6 +311,17 @@ async function fetchEnglishSrt(type, videoId, variant = 0, extra = '') {
 // Translation jobs + cache
 // ---------------------------------------------------------------------------
 const jobs = new Map(); // cacheKey -> { status: 'working'|'error', error?, startedAt }
+// Stremio often asks for subtitles BEFORE it knows the video's fingerprint,
+// then again WITH it seconds later — but the player may keep using the first
+// response's URLs. Remember the latest fingerprint per video so every request
+// is served the exact-matched (perfectly synced) file regardless of ordering.
+const lastExtra = new Map(); // `${type}-${videoId}` -> { extra, at }
+const LAST_EXTRA_TTL = 6 * 3600000;
+
+function rememberedExtra(type, videoId) {
+  const stored = lastExtra.get(`${type}-${videoId}`);
+  return stored && Date.now() - stored.at < LAST_EXTRA_TTL ? stored.extra : '';
+}
 
 function hashTag(extra) {
   const m = /videoHash=([^&]+)/.exec(extra || '');
@@ -403,7 +414,12 @@ async function handleSubtitlesRequest(req, res) {
   }
   // Stremio sends the exact video file's fingerprint (videoHash) — use it so
   // the first Hebrew option is translated from a perfectly-synced English file.
-  const extra = req.params.extra && req.params.extra.includes('videoHash=') ? req.params.extra : '';
+  let extra = req.params.extra && req.params.extra.includes('videoHash=') ? req.params.extra : '';
+  if (extra) {
+    lastExtra.set(`${type}-${id}`, { extra, at: Date.now() });
+  } else {
+    extra = rememberedExtra(type, id); // hash arrived on an earlier request
+  }
   ensureTranslation(type, id, 0, extra); // eagerly translate the first variant
 
   // Offer up to 3 Hebrew variants (each from a different English source file),
@@ -429,7 +445,7 @@ async function handleSubtitlesRequest(req, res) {
   for (let v = 0; v < variants; v++) {
     subtitles.push({
       id: `heb-ai-${cacheKeyFor(type, id, v, extra)}`,
-      url: `${baseUrl(req)}/subfile/${type}/${encodeURIComponent(id)}/v${v}.srt?b=3${xq}`,
+      url: `${baseUrl(req)}/subfile/${type}/${encodeURIComponent(id)}/v${v}.srt?b=4${xq}`,
       lang: 'heb',
     });
   }
@@ -442,7 +458,8 @@ app.get('/subtitles/:type/:id/:extra.json', handleSubtitlesRequest);
 function handleSubfileRequest(req, res) {
   const { type, id } = req.params;
   const variant = parseInt(String(req.params.variant || '0').replace(/\D/g, ''), 10) || 0;
-  const extra = typeof req.query.x === 'string' && req.query.x.includes('videoHash=') ? req.query.x : '';
+  let extra = typeof req.query.x === 'string' && req.query.x.includes('videoHash=') ? req.query.x : '';
+  if (!extra) extra = rememberedExtra(type, id); // fall back to the remembered fingerprint
   const key = cacheKeyFor(type, id, variant, extra);
   const file = cachePathFor(key);
   res.setHeader('Content-Type', 'text/srt; charset=utf-8');
