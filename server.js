@@ -8,9 +8,13 @@
  * lines are translated.
  *
  * Environment variables:
- *   GEMINI_API_KEY  - your free key from https://aistudio.google.com (recommended)
- *   GEMINI_MODEL    - optional, default "gemini-2.5-flash"
- *   PORT            - set automatically by Render
+ *   GEMINI_API_KEY        - your free key from https://aistudio.google.com (recommended)
+ *   GEMINI_MODEL          - optional, default "gemini-flash-latest"
+ *   TRANSLATE_PROVIDER    - optional: "gemini" (default) or "anthropic"
+ *   ANTHROPIC_API_KEY     - optional, enables Claude as the translation engine
+ *   ANTHROPIC_MODEL       - optional, default "claude-haiku-4-5"
+ *   TRANSLATE_CONCURRENCY - optional, parallel translation requests (default 4)
+ *   PORT                  - set automatically by Render
  */
 
 const express = require('express');
@@ -26,7 +30,9 @@ const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
 const CACHE_REPO = process.env.CACHE_REPO || 'arisurf/stremio-hebrew-subtitles';
 const OPENSUBS_BASE = 'https://opensubtitles-v3.strem.io';
 const CACHE_DIR = process.env.CACHE_DIR || '/tmp/hebsub-cache';
-const BATCH_SIZE = 50; // subtitle cues per Gemini request
+const BATCH_SIZE = Number(process.env.BATCH_SIZE || 80); // subtitle cues per AI request
+const CONCURRENCY = Number(process.env.TRANSLATE_CONCURRENCY || 4); // parallel AI requests
+const CONTEXT_LINES = 3; // English context lines shared across batch borders
 
 fs.mkdirSync(CACHE_DIR, { recursive: true });
 
@@ -35,7 +41,7 @@ fs.mkdirSync(CACHE_DIR, { recursive: true });
 // ---------------------------------------------------------------------------
 const MANIFEST = {
   id: 'org.ari.hebrew.ai.subtitles',
-  version: '1.1.0',
+  version: '1.2.0',
   name: 'Ari4KD Hebrew AI Subtitles',
   description:
     'כתוביות בעברית לכל סרט וסדרה: מוריד כתוביות באנגלית ומתרגם אותן לעברית עם AI, כולל שמירה מדויקת על התזמון. ' +
@@ -91,44 +97,106 @@ function buildSrt(cues, texts) {
 }
 
 // ---------------------------------------------------------------------------
-// Translation: Gemini primary, Google Translate fallback
+// Translation: provider-agnostic AI layer (Gemini default, Anthropic optional),
+// Google Translate as last-resort fallback
 // ---------------------------------------------------------------------------
-async function geminiTranslateBatch(lines, attempt = 0) {
-  const prompt =
-    'You are a professional subtitle translator. Translate the following English subtitle lines to natural, ' +
-    'fluent Hebrew as spoken in Israel. Rules:\n' +
-    '- Keep the SAME number of items, in the SAME order.\n' +
-    '- Preserve any HTML-like tags (e.g. <i>, </i>) and line breaks (\\n) inside each item.\n' +
-    "- Do NOT translate proper names; transliterate them naturally to Hebrew if appropriate.\n" +
-    '- Match gender and register from context (this is dialogue from a movie/series).\n' +
-    '- Keep translations concise enough to read as subtitles.\n' +
-    'Return ONLY a JSON array of the translated strings, nothing else.\n\n' +
-    'Input JSON array:\n' +
-    JSON.stringify(lines);
+const TRANSLATE_PROVIDER = (process.env.TRANSLATE_PROVIDER ||
+  (process.env.ANTHROPIC_API_KEY ? 'anthropic' : 'gemini')).toLowerCase();
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5';
 
+function hasAiKey() {
+  return TRANSLATE_PROVIDER === 'anthropic' ? !!ANTHROPIC_API_KEY : !!GEMINI_API_KEY;
+}
+function providerLabel() {
+  return TRANSLATE_PROVIDER === 'anthropic' ? `Anthropic (${ANTHROPIC_MODEL})` : `Gemini (${GEMINI_MODEL})`;
+}
+
+// Single completion call, dispatched by provider. Retries rate limits.
+async function llmComplete(prompt, maxTokens, attempt = 0) {
+  if (TRANSLATE_PROVIDER === 'anthropic' && ANTHROPIC_API_KEY) {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: ANTHROPIC_MODEL,
+        max_tokens: maxTokens,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+    if ((res.status === 429 || res.status === 529) && attempt < 2) {
+      await new Promise((r) => setTimeout(r, 15000 * (attempt + 1)));
+      return llmComplete(prompt, maxTokens, attempt + 1);
+    }
+    if (!res.ok) throw new Error(`Anthropic error ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const data = await res.json();
+    return (data.content || []).map((b) => b.text || '').join('').trim();
+  }
+
+  // Default: Gemini
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.2, responseMimeType: 'application/json', maxOutputTokens: 32768 },
+      generationConfig: { temperature: 0.2, maxOutputTokens: maxTokens },
     }),
   });
-
-  if (res.status === 429 || res.status === 503) {
-    if (attempt < 2) {
-      await new Promise((r) => setTimeout(r, 20000 * (attempt + 1)));
-      return geminiTranslateBatch(lines, attempt + 1);
-    }
-    throw new Error(`Gemini rate-limited (${res.status})`);
+  if ((res.status === 429 || res.status === 503) && attempt < 2) {
+    await new Promise((r) => setTimeout(r, 15000 * (attempt + 1)));
+    return llmComplete(prompt, maxTokens, attempt + 1);
   }
   if (!res.ok) throw new Error(`Gemini error ${res.status}: ${(await res.text()).slice(0, 200)}`);
-
   const data = await res.json();
   // Ignore "thought" parts emitted by thinking models — only keep real output.
   const parts = (data?.candidates?.[0]?.content?.parts || []).filter((p) => !p.thought);
-  let textOut = parts.map((p) => p.text || '').join('').trim();
+  return parts.map((p) => p.text || '').join('').trim();
+}
+
+// Pre-pass: build a character guide (names, genders, relationships) from the
+// full dialogue so every batch can translate Hebrew gender correctly even for
+// characters who only appear elsewhere in the episode.
+async function buildCharacterSheet(cues, log) {
+  try {
+    const sample = cues.map((c) => c.text.replace(/\n/g, ' ')).join('\n').slice(0, 9000);
+    const sheet = await llmComplete(
+      'Read this movie/series dialogue (subtitle lines in order). Identify the characters who speak or are addressed.\n' +
+        'For each: name, gender (male/female/unknown), the natural Hebrew transliteration of the name, and a few words on who they are / how they relate to the others.\n' +
+        'Also note the overall register (formal, slang, military, period drama, etc.).\n' +
+        'Max 15 characters. Be concise. Plain text list only, no preamble.\n\n' +
+        'Dialogue:\n' + sample,
+      1024
+    );
+    if (sheet) log('character sheet ready');
+    return sheet || '';
+  } catch (e) {
+    log(`character sheet failed (${e.message}) — translating without it`);
+    return '';
+  }
+}
+
+async function aiTranslateBatch(lines, sheet, contextBefore, contextAfter) {
+  const prompt =
+    'You are a professional subtitle translator. Translate the following English subtitle lines to natural, ' +
+    'fluent Hebrew as spoken in Israel. Rules:\n' +
+    '- Keep the SAME number of items, in the SAME order.\n' +
+    '- Preserve any HTML-like tags (e.g. <i>, </i>) and line breaks (\\n) inside each item.\n' +
+    '- Do NOT translate proper names; transliterate them naturally to Hebrew.\n' +
+    '- Hebrew is a gendered language: use the character guide to inflect verbs, adjectives and pronouns for the correct gender of the SPEAKER, and when a line addresses someone, for the ADDRESSEE.\n' +
+    '- Match register from context. Keep translations concise enough to read as subtitles.\n' +
+    'Return ONLY a JSON array of the translated strings, nothing else.\n\n' +
+    (sheet ? 'Character guide:\n' + sheet + '\n\n' : '') +
+    (contextBefore.length ? 'Preceding dialogue (context only — do NOT include in output):\n' + JSON.stringify(contextBefore) + '\n\n' : '') +
+    (contextAfter.length ? 'Following dialogue (context only — do NOT include in output):\n' + JSON.stringify(contextAfter) + '\n\n' : '') +
+    'Input JSON array:\n' +
+    JSON.stringify(lines);
+
+  let textOut = await llmComplete(prompt, 32768);
   // Strip markdown code fences if present.
   textOut = textOut.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
   let arr;
@@ -136,19 +204,19 @@ async function geminiTranslateBatch(lines, attempt = 0) {
     arr = JSON.parse(textOut);
   } catch {
     const m = textOut.match(/\[[\s\S]*\]/);
-    if (!m) throw new Error('Gemini returned non-JSON output');
+    if (!m) throw new Error('model returned non-JSON output');
     arr = JSON.parse(m[0]);
   }
   if (!Array.isArray(arr) || arr.length !== lines.length) {
-    throw new Error(`Gemini returned ${Array.isArray(arr) ? arr.length : 'invalid'} items, expected ${lines.length}`);
+    throw new Error(`model returned ${Array.isArray(arr) ? arr.length : 'invalid'} items, expected ${lines.length}`);
   }
   const out = arr.map((s) => String(s));
   // Sanity check: the output must actually be Hebrew. If the model echoed the
   // English input (or answered in another language), treat it as a failure so
-  // the caller falls back to Google Translate for this batch.
+  // the batch is retried instead of shipping English lines.
   const hebrewCount = out.filter((s) => /[֐-׿]/.test(s)).length;
   if (hebrewCount < out.length * 0.4) {
-    throw new Error(`Gemini output not in Hebrew (${hebrewCount}/${out.length} lines contain Hebrew)`);
+    throw new Error(`output not in Hebrew (${hebrewCount}/${out.length} lines contain Hebrew)`);
   }
   return out;
 }
@@ -176,29 +244,88 @@ async function googleTranslateBatch(lines) {
   return out;
 }
 
+// Run fn over items with at most `limit` in flight at once.
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
 async function translateAll(cues, log) {
   const texts = cues.map((c) => c.text);
   const results = new Array(texts.length);
+
+  if (!hasAiKey()) {
+    log('no AI API key set — using Google Translate');
+    const out = await googleTranslateBatch(texts);
+    for (let i = 0; i < out.length; i++) results[i] = out[i];
+    return results;
+  }
+
+  const sheet = await buildCharacterSheet(cues, log);
+
+  // Split into batches, each carrying a few surrounding English lines so the
+  // conversation doesn't get cut mid-exchange at batch borders.
+  const batches = [];
   for (let start = 0; start < texts.length; start += BATCH_SIZE) {
-    const batch = texts.slice(start, start + BATCH_SIZE);
-    let translated;
-    if (GEMINI_API_KEY) {
-      try {
-        translated = await geminiTranslateBatch(batch);
-      } catch (e1) {
-        log(`Gemini failed for batch at ${start} (${e1.message}); retrying once`);
-        try {
-          translated = await geminiTranslateBatch(batch);
-        } catch (e2) {
-          log(`Gemini retry failed for batch at ${start} (${e2.message}); falling back to Google Translate`);
-          translated = await googleTranslateBatch(batch);
-        }
-      }
-    } else {
-      translated = await googleTranslateBatch(batch);
+    batches.push({
+      start,
+      lines: texts.slice(start, start + BATCH_SIZE),
+      before: texts.slice(Math.max(0, start - CONTEXT_LINES), start),
+      after: texts.slice(start + BATCH_SIZE, start + BATCH_SIZE + CONTEXT_LINES),
+    });
+  }
+
+  // Pass 1: all batches in parallel (bounded).
+  let done = 0;
+  const failed = [];
+  await mapLimit(batches, CONCURRENCY, async (b) => {
+    try {
+      const out = await aiTranslateBatch(b.lines, sheet, b.before, b.after);
+      for (let i = 0; i < out.length; i++) results[b.start + i] = out[i];
+    } catch (e) {
+      log(`batch at ${b.start} failed (${e.message}) — deferred for retry`);
+      failed.push(b);
     }
-    for (let i = 0; i < translated.length; i++) results[start + i] = translated[i];
-    log(`translated ${Math.min(start + BATCH_SIZE, texts.length)}/${texts.length} cues`);
+    done++;
+    log(`progress: ${done}/${batches.length} batches`);
+  });
+
+  // Pass 2: deferred retry — rate-limit pressure is lower after the main wave.
+  for (const b of failed.splice(0)) {
+    try {
+      await new Promise((r) => setTimeout(r, 5000));
+      const out = await aiTranslateBatch(b.lines, sheet, b.before, b.after);
+      for (let i = 0; i < out.length; i++) results[b.start + i] = out[i];
+      log(`batch at ${b.start} recovered on retry`);
+    } catch (e) {
+      log(`batch at ${b.start} failed again (${e.message}) — Google Translate fallback`);
+      const out = await googleTranslateBatch(b.lines);
+      for (let i = 0; i < out.length; i++) results[b.start + i] = out[i];
+    }
+  }
+
+  // Pass 3: sweep any line that still ended up non-Hebrew (e.g. Google
+  // Translate per-line failures) and give them one more AI attempt together.
+  const missing = [];
+  for (let i = 0; i < results.length; i++) {
+    if (results[i] && !/[֐-׿]/.test(results[i]) && /[a-zA-Z]/.test(results[i])) missing.push(i);
+  }
+  if (missing.length > 0 && missing.length <= 150) {
+    log(`re-translating ${missing.length} lines that stayed in English`);
+    try {
+      const out = await aiTranslateBatch(missing.map((i) => texts[i]), sheet, [], []);
+      for (let j = 0; j < missing.length; j++) results[missing[j]] = out[j];
+    } catch {
+      /* keep whatever we have */
+    }
   }
   return results;
 }
@@ -764,11 +891,23 @@ app.get('/', (req, res) => {
 <p>או הדביקו את הכתובת הזו בחיפוש התוספים של Stremio:</p>
 <p><code>${manifestUrl}</code></p>
 <p>רוצים לשתף עם חברים? פשוט שלחו להם את הקישור לעמוד הזה.</p>
-<p class="en">Status: ${GEMINI_API_KEY ? 'Gemini AI translation enabled' : 'No GEMINI_API_KEY set — using Google Translate fallback'} · Model: ${GEMINI_MODEL}</p>
+<p class="en">Status: ${hasAiKey() ? 'AI translation enabled' : 'No AI API key set — using Google Translate fallback'} · Engine: ${providerLabel()}</p>
 </body></html>`);
 });
 
 app.listen(PORT, () => {
   console.log(`Hebrew AI Subtitles add-on running on port ${PORT}`);
-  console.log(GEMINI_API_KEY ? `Gemini enabled (${GEMINI_MODEL})` : 'WARNING: GEMINI_API_KEY not set — Google Translate fallback only');
+  console.log(hasAiKey() ? `AI translation enabled: ${providerLabel()}` : 'WARNING: no AI API key set — Google Translate fallback only');
 });
+
+// Keep-alive: Render's free tier spins the instance down after ~15 min idle,
+// causing 50s+ cold starts right when subtitles are requested. Ping ourselves
+// so the instance stays warm (one always-on free service fits Render's 750
+// free instance-hours per month).
+const SELF_URL = (process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
+if (SELF_URL) {
+  setInterval(() => {
+    fetch(`${SELF_URL}/health`).catch(() => {});
+  }, 10 * 60 * 1000);
+  console.log(`[keepalive] pinging ${SELF_URL}/health every 10 minutes`);
+}

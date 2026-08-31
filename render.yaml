@@ -5,6 +5,11 @@ services:
     plan: free
     buildCommand: npm install
     startCommand: node server.js
+    # Cache commits must NOT trigger redeploys (a redeploy restarts the server
+    # and kills in-flight translation jobs). Mirrors the dashboard setting.
+    buildFilters:
+      ignoredPaths:
+        - cache/**
     envVars:
       - key: GEMINI_API_KEY
         sync: false
