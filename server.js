@@ -32,6 +32,7 @@ const OPENSUBS_BASE = 'https://opensubtitles-v3.strem.io';
 const CACHE_DIR = process.env.CACHE_DIR || '/tmp/hebsub-cache';
 const BATCH_SIZE = Number(process.env.BATCH_SIZE || 80); // subtitle cues per AI request
 const CONCURRENCY = Number(process.env.TRANSLATE_CONCURRENCY || 4); // parallel AI requests
+const SUBFILE_HOLD_MS = Number(process.env.SUBFILE_HOLD_MS || 55000); // hold subtitle request open while translating (Render proxy limit ~100s)
 const CONTEXT_LINES = 3; // English context lines shared across batch borders
 
 fs.mkdirSync(CACHE_DIR, { recursive: true });
@@ -41,7 +42,7 @@ fs.mkdirSync(CACHE_DIR, { recursive: true });
 // ---------------------------------------------------------------------------
 const MANIFEST = {
   id: 'org.ari.hebrew.ai.subtitles',
-  version: '1.2.0',
+  version: '1.3.0',
   name: 'Ari4KD Hebrew AI Subtitles',
   description:
     'כתוביות בעברית לכל סרט וסדרה: מוריד כתוביות באנגלית ומתרגם אותן לעברית עם AI, כולל שמירה מדויקת על התזמון. ' +
@@ -258,7 +259,7 @@ async function mapLimit(items, limit, fn) {
   return results;
 }
 
-async function translateAll(cues, log) {
+async function translateAll(cues, log, onProgress) {
   const texts = cues.map((c) => c.text);
   const results = new Array(texts.length);
 
@@ -296,6 +297,7 @@ async function translateAll(cues, log) {
     }
     done++;
     log(`progress: ${done}/${batches.length} batches`);
+    if (onProgress) onProgress(done, batches.length);
   });
 
   // Pass 2: deferred retry — rate-limit pressure is lower after the main wave.
@@ -694,7 +696,10 @@ function ensureTranslation(type, videoId, variant = 0, extra = '', key = '') {
     log('starting translation job');
     const { cues, cand } = await fetchEnglishSrt(type, videoId, variant, extra);
     log(`fetched English subtitles: ${cues.length} cues`);
-    const translated = await translateAll(cues, log);
+    const translated = await translateAll(cues, log, (done, total) => {
+      const j = jobs.get(key);
+      if (j && j.status === 'working') j.progress = { done, total, at: Date.now() };
+    });
     // Identification cue: shown during the first seconds of playback so the
     // user knows which variant they picked and whether it is file-verified.
     const idLabel = `Ari4KD · גרסה ${variant + 1}${cand && cand.hashMatch ? ' · ✓ מסונכרן לקובץ' : ''}`;
@@ -709,6 +714,29 @@ function ensureTranslation(type, videoId, variant = 0, extra = '', key = '') {
     console.error(`[${key}] FAILED: ${e.message}`);
     jobs.set(key, { status: 'error', error: e.message, startedAt: Date.now() });
   });
+}
+
+// Hold a subtitle request open until the translation job finishes (or maxMs
+// elapses). Stremio downloads the .srt exactly once per selection, so serving
+// the real file inside that first response removes the "re-select" dance.
+async function waitForTranslation(key, maxMs) {
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(cachePathFor(key))) return 'done';
+    const job = jobs.get(key);
+    if (job && job.status === 'error') return 'error';
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  return 'timeout';
+}
+
+// Human-readable ETA for the fallback placeholder, based on batch progress.
+function etaText(job) {
+  const p = job && job.progress;
+  if (!p || !p.done) return '';
+  const elapsed = (Date.now() - job.startedAt) / 1000;
+  const remaining = Math.max(5, Math.round((elapsed / p.done) * (p.total - p.done)));
+  return ` | ${p.done}/${p.total} הושלמו, עוד ~${remaining} שניות | ${p.done}/${p.total} done, ~${remaining}s left`;
 }
 
 function placeholderSrt(message) {
@@ -856,13 +884,25 @@ async function handleSubfileRequest(req, res) {
   }
 
   ensureTranslation(type, id, variant, extra, key);
+
+  // Hold the request open so the player receives the real Hebrew file in this
+  // same response — no re-select needed. Render's proxy allows ~100s, so a
+  // 55s hold is safe; most jobs finish well within it.
+  const outcome = await waitForTranslation(key, SUBFILE_HOLD_MS);
+  if (outcome === 'done') {
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    return res.send(fs.readFileSync(cachePathFor(key), 'utf8'));
+  }
+
   const job = jobs.get(key);
   res.setHeader('Cache-Control', 'no-store');
-  if (job && job.status === 'error') {
-    return res.send(placeholderSrt(`שגיאה בתרגום: ${job.error} | Translation error`));
+  if (outcome === 'error' || (job && job.status === 'error')) {
+    return res.send(placeholderSrt(`שגיאה בתרגום: ${job && job.error} | Translation error`));
   }
   return res.send(
-    placeholderSrt('התרגום לעברית בהכנה... בחרו שוב את הכתוביות בעוד כדקה | Translating to Hebrew, re-select subtitles in ~1 minute')
+    placeholderSrt(
+      `התרגום לעברית עדיין בהכנה — בחרו שוב את הכתוביות${etaText(job)} | Still translating — re-select subtitles`
+    )
   );
 }
 
