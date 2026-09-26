@@ -15,7 +15,7 @@
  *   ANTHROPIC_MODEL       - optional, default "claude-haiku-4-5"
  *   TRANSLATE_CONCURRENCY - optional, parallel translation requests (default 4)
  *   SUBFILE_HOLD_MS       - optional, how long a subtitle request waits for a
- *                           running translation before answering (default 55000)
+ *                           running translation before answering (default 180000)
  *   PREFETCH_NEXT         - optional, "0" disables translating the next episode ahead
  *   PORT                  - set automatically by Render
  */
@@ -36,7 +36,9 @@ const OPENSUBS_BASE = process.env.OPENSUBS_BASE || 'https://opensubtitles-v3.str
 const CACHE_DIR = process.env.CACHE_DIR || '/tmp/hebsub-cache';
 const BATCH_SIZE = Number(process.env.BATCH_SIZE || 80); // subtitle cues per AI request
 const CONCURRENCY = Number(process.env.TRANSLATE_CONCURRENCY || 4); // parallel AI requests
-const SUBFILE_HOLD_MS = Number(process.env.SUBFILE_HOLD_MS || 55000); // hold subtitle request open while translating
+// Hold a subtitle request open while translating. Render was measured to keep
+// requests open for 300s (2026-09-26), so 3 minutes covers full-length movies.
+const SUBFILE_HOLD_MS = Number(process.env.SUBFILE_HOLD_MS || 180000);
 const ANALYZE_LIMIT = Number(process.env.ANALYZE_LIMIT || 10); // English sources compared per video
 const PREFETCH_NEXT = process.env.PREFETCH_NEXT !== '0';
 const MAX_VARIANTS = 3;
@@ -1098,13 +1100,6 @@ app.get('/debug/plan/:type/:id.json', async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
-});
-
-// Diagnostics: how long the hosting proxy lets a request stay open.
-app.get('/debug/hold', async (req, res) => {
-  const secs = Math.min(300, Math.max(1, Number(req.query.s) || 10));
-  await sleep(secs * 1000);
-  res.send(`held ${secs}s`);
 });
 
 app.get('/health', (req, res) => res.send('ok'));
