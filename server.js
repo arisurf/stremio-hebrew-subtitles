@@ -1,11 +1,11 @@
 /**
  * Stremio Add-on: Hebrew AI Subtitles
  * ------------------------------------
- * Fetches English subtitles for any movie/episode (via Stremio's public
- * OpenSubtitles v3 service), translates them to Hebrew using Google Gemini
- * (with free Google Translate as automatic fallback), and serves them back
- * to Stremio. All subtitle timings are preserved exactly — only the text
- * lines are translated.
+ * Finds English subtitles for any movie/episode (via Stremio's public
+ * OpenSubtitles v3 service), picks the ones whose timing matches the user's
+ * exact video file (see sync.js), translates them to Hebrew using Google
+ * Gemini (with free Google Translate as automatic fallback), and serves them
+ * back to Stremio.
  *
  * Environment variables:
  *   GEMINI_API_KEY        - your free key from https://aistudio.google.com (recommended)
@@ -14,12 +14,16 @@
  *   ANTHROPIC_API_KEY     - optional, enables Claude as the translation engine
  *   ANTHROPIC_MODEL       - optional, default "claude-haiku-4-5"
  *   TRANSLATE_CONCURRENCY - optional, parallel translation requests (default 4)
+ *   SUBFILE_HOLD_MS       - optional, how long a subtitle request waits for a
+ *                           running translation before answering (default 55000)
+ *   PREFETCH_NEXT         - optional, "0" disables translating the next episode ahead
  *   PORT                  - set automatically by Render
  */
 
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const sync = require('./sync');
 
 const PORT = process.env.PORT || 7000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
@@ -28,25 +32,40 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-flash-latest';
 // repo so they survive server restarts/redeploys (Render free disk is wiped).
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
 const CACHE_REPO = process.env.CACHE_REPO || 'arisurf/stremio-hebrew-subtitles';
-const OPENSUBS_BASE = 'https://opensubtitles-v3.strem.io';
+const OPENSUBS_BASE = process.env.OPENSUBS_BASE || 'https://opensubtitles-v3.strem.io';
 const CACHE_DIR = process.env.CACHE_DIR || '/tmp/hebsub-cache';
 const BATCH_SIZE = Number(process.env.BATCH_SIZE || 80); // subtitle cues per AI request
 const CONCURRENCY = Number(process.env.TRANSLATE_CONCURRENCY || 4); // parallel AI requests
-const SUBFILE_HOLD_MS = Number(process.env.SUBFILE_HOLD_MS || 55000); // hold subtitle request open while translating (Render proxy limit ~100s)
+const SUBFILE_HOLD_MS = Number(process.env.SUBFILE_HOLD_MS || 55000); // hold subtitle request open while translating
+const ANALYZE_LIMIT = Number(process.env.ANALYZE_LIMIT || 10); // English sources compared per video
+const PREFETCH_NEXT = process.env.PREFETCH_NEXT !== '0';
+const MAX_VARIANTS = 3;
 const CONTEXT_LINES = 3; // English context lines shared across batch borders
 
 fs.mkdirSync(CACHE_DIR, { recursive: true });
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function pruneMap(map, max) {
+  while (map.size > max) map.delete(map.keys().next().value);
+}
+
+function fetchWithTimeout(url, ms, opts = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  return fetch(url, { ...opts, signal: controller.signal }).finally(() => clearTimeout(timer));
+}
 
 // ---------------------------------------------------------------------------
 // Manifest
 // ---------------------------------------------------------------------------
 const MANIFEST = {
   id: 'org.ari.hebrew.ai.subtitles',
-  version: '1.3.0',
+  version: '1.4.0',
   name: 'Ari4KD Hebrew AI Subtitles',
   description:
-    'כתוביות בעברית לכל סרט וסדרה: מוריד כתוביות באנגלית ומתרגם אותן לעברית עם AI, כולל שמירה מדויקת על התזמון. ' +
-    'Fetches English subtitles and translates them to Hebrew with AI, preserving exact timing.',
+    'כתוביות בעברית לכל סרט וסדרה: בוחר אוטומטית את הכתוביות באנגלית שמסונכרנות לקובץ שלכם ומתרגם אותן לעברית עם AI. ' +
+    'Picks the English subtitles that match your exact video file and translates them to Hebrew with AI.',
   logo: 'https://em-content.zobj.net/source/twitter/376/israel_1f1ee-1f1f1.png',
   resources: ['subtitles'],
   types: ['movie', 'series'],
@@ -54,48 +73,6 @@ const MANIFEST = {
   catalogs: [],
   behaviorHints: { configurable: false, configurationRequired: false },
 };
-
-// ---------------------------------------------------------------------------
-// SRT parsing / building (timings are never modified)
-// ---------------------------------------------------------------------------
-function parseSrt(raw) {
-  const text = raw.replace(/^﻿/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-  const blocks = text.split(/\n{2,}/);
-  const cues = [];
-  for (const block of blocks) {
-    const lines = block.split('\n').filter((l) => l.trim() !== '');
-    if (lines.length < 2) continue;
-    let i = 0;
-    if (/^\d+$/.test(lines[0].trim()) && lines.length > 1 && lines[1].includes('-->')) i = 1;
-    if (!lines[i] || !lines[i].includes('-->')) continue;
-    const timing = lines[i].trim();
-    const textLines = lines.slice(i + 1);
-    if (textLines.length === 0) continue;
-    // Strip ASS/SSA formatting tags like {\an8} — players show them as literal text.
-    const text = textLines.join('\n').replace(/\{\\[^}]*\}/g, '').trim();
-    if (!text) continue;
-    cues.push({ timing, text });
-  }
-  return cues;
-}
-
-// Wrap each line in an RTL embedding (U+202B ... U+202C) so punctuation at
-// BOTH ends of the line renders on the correct side in Hebrew, even in
-// players that lay subtitles out left-to-right.
-const RLE = '‫';
-const PDF = '‬';
-
-function buildSrt(cues, texts) {
-  const out = [];
-  for (let i = 0; i < cues.length; i++) {
-    const text = (texts[i] || cues[i].text).trim();
-    out.push(String(i + 1));
-    out.push(cues[i].timing);
-    out.push(text.split('\n').map((l) => RLE + l.trim() + PDF).join('\n'));
-    out.push('');
-  }
-  return out.join('\n');
-}
 
 // ---------------------------------------------------------------------------
 // Translation: provider-agnostic AI layer (Gemini default, Anthropic optional),
@@ -232,7 +209,7 @@ async function googleTranslateLine(line) {
   return (data[0] || []).map((seg) => seg[0]).join('');
 }
 
-async function googleTranslateBatch(lines) {
+async function googleTranslateBatch(lines, onLine) {
   const out = [];
   for (const line of lines) {
     try {
@@ -240,6 +217,7 @@ async function googleTranslateBatch(lines) {
     } catch {
       out.push(line); // worst case: keep English for this cue
     }
+    if (onLine) onLine(out.length, lines.length);
     await new Promise((r) => setTimeout(r, 120));
   }
   return out;
@@ -265,7 +243,9 @@ async function translateAll(cues, log, onProgress) {
 
   if (!hasAiKey()) {
     log('no AI API key set — using Google Translate');
-    const out = await googleTranslateBatch(texts);
+    const out = await googleTranslateBatch(texts, (done, total) => {
+      if (onProgress && (done % 20 === 0 || done === total)) onProgress(done, total);
+    });
     for (let i = 0; i < out.length; i++) results[i] = out[i];
     return results;
   }
@@ -333,281 +313,245 @@ async function translateAll(cues, log, onProgress) {
 }
 
 // ---------------------------------------------------------------------------
-// Fetch English subtitles from Stremio's public OpenSubtitles service
+// English sources from Stremio's public OpenSubtitles service
 // ---------------------------------------------------------------------------
-const candidatesCache = new Map(); // key -> { list, at }
-
-async function fetchCandidateList(type, videoId, extra) {
-  const url = `${OPENSUBS_BASE}/subtitles/${type}/${encodeURIComponent(videoId)}${extra ? '/' + extra : ''}.json`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`OpenSubtitles lookup failed (${res.status})`);
-  const data = await res.json();
-  return (data.subtitles || []).filter((s) => s.lang === 'eng');
-}
-
-async function getEnglishCandidates(type, videoId, extra = '') {
-  const key = `${type}-${videoId}-${extra}`;
-  const hit = candidatesCache.get(key);
-  if (hit && Date.now() - hit.at < 3600000) return applySticky(type, videoId, hit.list);
-
-  // If Stremio told us the exact video file (videoHash), ask for subtitles
-  // matched to that precise file first — those are perfectly in sync.
-  let hashMatched = [];
-  if (extra && extra.includes('videoHash=')) {
+// Stremio's fingerprint extra ("filename=…&videoSize=…&videoHash=…"),
+// already URL-decoded by Express.
+function parseExtra(extra) {
+  const out = {};
+  for (const part of String(extra || '').split('&')) {
+    const i = part.indexOf('=');
+    if (i <= 0) continue;
+    const val = part.slice(i + 1);
     try {
-      hashMatched = await fetchCandidateList(type, videoId, extra);
-      hashMatched.forEach((s) => { s.hashMatch = true; });
+      out[part.slice(0, i)] = decodeURIComponent(val);
     } catch {
-      /* fall through to the general list */
+      out[part.slice(0, i)] = val;
     }
   }
-
-  // Keep the upstream order — the service already ranks the best-matched
-  // release first, and re-sorting was overriding that ranking.
-  const general = await fetchCandidateList(type, videoId, '');
-
-  // Hash-matched files first, then the rest (deduplicated).
-  const seen = new Set(hashMatched.map((s) => s.id));
-  const candidates = hashMatched.concat(general.filter((s) => !seen.has(s.id)));
-  candidatesCache.set(key, { list: candidates, at: Date.now() });
-  return applySticky(type, videoId, candidates);
+  return out;
+}
+function extraPath(extra) {
+  return Object.entries(parseExtra(extra))
+    .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
+    .join('&');
 }
 
-// ---------------------------------------------------------------------------
-// Timing signatures: probe each English source to learn when its subtitles
-// end, so the user can match a variant against the episode's runtime, and so
-// variants that agree with each other can be marked as cross-validated.
-// ---------------------------------------------------------------------------
-const sigCache = new Map(); // candidate id -> { sig: {first,last}|null, at }
-
-function timeToSeconds(t) {
-  const m = /(\d+):(\d+):(\d+)[,.](\d+)/.exec(t);
-  if (!m) return null;
-  return +m[1] * 3600 + +m[2] * 60 + +m[3];
+const listCache = new Map(); // url -> { subs, at }
+async function fetchSubsList(type, videoId, extra) {
+  const url = `${OPENSUBS_BASE}/subtitles/${type}/${encodeURIComponent(videoId)}${extra ? '/' + extraPath(extra) : ''}.json`;
+  const hit = listCache.get(url);
+  if (hit && Date.now() - hit.at < 3600000) return hit.subs;
+  const res = await fetchWithTimeout(url, 15000);
+  if (!res.ok) throw new Error(`OpenSubtitles lookup failed (${res.status})`);
+  const subs = (await res.json()).subtitles || [];
+  listCache.set(url, { subs, at: Date.now() });
+  pruneMap(listCache, 500);
+  return subs;
 }
 
-function formatSeconds(sec) {
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  const s = Math.floor(sec % 60);
-  const mm = String(m).padStart(2, '0');
-  const ss = String(s).padStart(2, '0');
-  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+// English candidates (upstream order) plus "references": subtitles in ANY
+// language that OpenSubtitles matched to the user's exact file by its hash.
+// A reference's timing is the true timing of that file.
+async function getSources(type, videoId, extra) {
+  const [general, hashed] = await Promise.all([
+    fetchSubsList(type, videoId, ''),
+    extra
+      ? fetchSubsList(type, videoId, extra).catch((e) => {
+          console.log(`[sources] fingerprint lookup failed: ${e.message}`);
+          return [];
+        })
+      : [],
+  ]);
+  const refs = hashed.filter((s) => s.m === 'h' && s.url).slice(0, 2);
+  const seen = new Set();
+  const english = [];
+  for (const s of hashed.concat(general)) {
+    if (s.lang !== 'eng' || !s.url || seen.has(String(s.id))) continue;
+    seen.add(String(s.id));
+    english.push(s);
+  }
+  return { english, refs };
 }
 
-async function timingSignature(cand) {
-  const hit = sigCache.get(cand.id);
-  if (hit && Date.now() - hit.at < 3600000) return hit.sig;
-  let sig = null;
+// Downloads go through a small queue: bursts of parallel requests to the
+// subtitle CDN intermittently fail, which silently shrank the analysis.
+const DOWNLOAD_CONCURRENCY = 4;
+let downloadsActive = 0;
+const downloadQueue = [];
+async function withDownloadSlot(fn) {
+  if (downloadsActive >= DOWNLOAD_CONCURRENCY) await new Promise((r) => downloadQueue.push(r));
+  downloadsActive++;
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8000);
-    const r = await fetch(cand.url, { signal: controller.signal });
-    clearTimeout(timer);
-    if (r.ok) {
-      const cues = parseSrt(await r.text());
-      if (cues.length >= 5) {
-        const first = timeToSeconds(cues[0].timing.split('-->')[0]);
-        const last = timeToSeconds(cues[cues.length - 1].timing.split('-->')[1] || cues[cues.length - 1].timing);
-        if (first != null && last != null) sig = { first, last };
-      }
-    }
-  } catch {
-    /* signature unavailable — label will omit the time */
+    return await fn();
+  } finally {
+    downloadsActive--;
+    const next = downloadQueue.shift();
+    if (next) next();
   }
-  sigCache.set(cand.id, { sig, at: Date.now() });
-  return sig;
 }
 
-async function fetchEnglishSrt(type, videoId, variant = 0, extra = '') {
-  const candidates = await getEnglishCandidates(type, videoId, extra);
-  if (candidates.length === 0) throw new Error('No English subtitles found for this video');
-  // Start from the requested variant, then rotate through the rest as fallback.
-  const ordered = candidates.slice(variant % candidates.length).concat(candidates.slice(0, variant % candidates.length));
+async function downloadSubtitle(sub) {
   let lastErr;
-  for (const cand of ordered.slice(0, 3)) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt) await sleep(800 * attempt);
     try {
-      const r = await fetch(cand.url);
-      if (!r.ok) throw new Error(`download ${r.status}`);
-      const srt = await r.text();
-      const cues = parseSrt(srt);
-      if (cues.length < 5) throw new Error('subtitle file looks empty/corrupt');
-      return { cues, cand };
+      const r = await withDownloadSlot(() => fetchWithTimeout(sub.url, 15000).then(async (res) => ({ res, text: await res.text() })));
+      if (!r.res.ok) throw new Error(`HTTP ${r.res.status}`);
+      const cues = sync.parseSrt(r.text);
+      if (cues.length < 5) throw new Error(`only ${cues.length} cues in ${r.text.length} bytes`);
+      return cues;
     } catch (e) {
       lastErr = e;
     }
   }
-  throw new Error(`Could not download English subtitles: ${lastErr && lastErr.message}`);
+  console.log(`[source] ${sub.id} "${sub.subtitleFileName || ''}" unusable: ${lastErr.message}`);
+  throw lastErr;
+}
+
+// Downloaded + parsed source subtitles, shared by analysis and translation so
+// every file is fetched once. Entries are { promise } while downloading.
+const srcCache = new Map(); // subtitle id -> { cues, at } | { promise }
+function loadSourceCues(sub) {
+  const id = String(sub.id);
+  const hit = srcCache.get(id);
+  if (hit && hit.promise) return hit.promise;
+  if (hit && Date.now() - hit.at < 6 * 3600000) return Promise.resolve(hit.cues);
+  const promise = downloadSubtitle(sub);
+  srcCache.set(id, { promise });
+  promise.then(
+    (cues) => {
+      srcCache.set(id, { cues, at: Date.now() });
+      pruneMap(srcCache, 150);
+    },
+    () => srcCache.delete(id)
+  );
+  return promise;
 }
 
 // ---------------------------------------------------------------------------
-// Translation jobs + cache
+// Plans: which sources to offer for one video, best first (see sync.js)
 // ---------------------------------------------------------------------------
-const jobs = new Map(); // cacheKey -> { status: 'working'|'error', error?, startedAt }
-// Stremio often asks for subtitles BEFORE it knows the video's fingerprint,
-// then again WITH it seconds later — but the player may keep using the first
-// response's URLs. Remember the latest fingerprint per video so every request
-// is served the exact-matched (perfectly synced) file regardless of ordering.
-const lastExtra = new Map(); // `${type}-${videoId}` -> { extra, at }
-const LAST_EXTRA_TTL = 6 * 3600000;
+const planCache = new Map(); // `${type}|${videoId}|${extra}` -> { plan, at, ttl } | { promise }
+// Per series: the sources that were VERIFIED against the user's own file on
+// some episode (a timing "family"). Episodes without a hash-matched reference
+// — including the next episode, translated ahead of time — pick from the same
+// family. Persisted in the cache repo so it survives restarts.
+const seriesFamily = new Map(); // imdb id -> { members: [{ id, tokens }], at, episode }
+const FAMILY_TTL = 180 * 24 * 3600000;
 
-function rememberedExtra(type, videoId) {
-  const stored = lastExtra.get(`${type}-${videoId}`);
-  return stored && Date.now() - stored.at < LAST_EXTRA_TTL ? stored.extra : '';
+function getPlan(type, videoId, extra) {
+  const key = `${type}|${videoId}|${extra || ''}`;
+  const hit = planCache.get(key);
+  if (hit && hit.promise) return hit.promise;
+  if (hit && Date.now() - hit.at < hit.ttl) return Promise.resolve(hit.plan);
+  const promise = computePlan(type, videoId, extra || '');
+  planCache.set(key, { promise });
+  promise.then(
+    (plan) => {
+      // A plan built from incomplete downloads is only kept briefly.
+      planCache.set(key, { plan, at: Date.now(), ttl: plan.coverage >= 0.8 ? 3600000 : 120000 });
+      pruneMap(planCache, 300);
+    },
+    () => planCache.delete(key)
+  );
+  return promise;
 }
 
-// Fingerprints must survive instance restarts (Render free churns instances
-// constantly, and the player's request often lands on a freshly-woken server
-// whose memory is empty — which served generic, unsynced files).
-let extrasLoaded = false;
-async function loadExtrasFromRemote() {
-  if (!GITHUB_TOKEN || extrasLoaded) return;
-  extrasLoaded = true;
-  try {
-    const r = await fetch(`https://api.github.com/repos/${CACHE_REPO}/contents/cache/extras.json`, {
-      headers: { ...ghHeaders(), Accept: 'application/vnd.github.raw' },
-    });
-    if (!r.ok) return;
-    const obj = JSON.parse(await r.text());
-    for (const [k, v] of Object.entries(obj)) if (!lastExtra.has(k)) lastExtra.set(k, v);
-    console.log(`[cache] loaded ${Object.keys(obj).length} fingerprints from GitHub`);
-  } catch {
-    /* non-fatal */
+function familyFor(type, videoId) {
+  if (type !== 'series') return [];
+  const f = seriesFamily.get(String(videoId).split(':')[0]);
+  return f && Date.now() - f.at < FAMILY_TTL ? f.members : [];
+}
+
+async function computePlan(type, videoId, extra) {
+  const t0 = Date.now();
+  const { english, refs } = await getSources(type, videoId, extra);
+  if (!english.length) {
+    console.log(`[plan] ${videoId}: no English subtitles on OpenSubtitles`);
+    return { mode: 'none', refNote: '', variants: [], all: [], english, coverage: 1 };
   }
-}
-
-let extrasSaveTimer = null;
-function saveExtrasSoon() {
-  if (!GITHUB_TOKEN) return;
-  clearTimeout(extrasSaveTimer);
-  extrasSaveTimer = setTimeout(async () => {
-    try {
-      const fresh = {};
-      for (const [k, v] of lastExtra) if (Date.now() - v.at < LAST_EXTRA_TTL) fresh[k] = v;
-      const apiUrl = `https://api.github.com/repos/${CACHE_REPO}/contents/cache/extras.json`;
-      let sha;
-      const g = await fetch(apiUrl, { headers: ghHeaders() });
-      if (g.ok) sha = (await g.json()).sha;
-      await fetch(apiUrl, {
-        method: 'PUT',
-        headers: ghHeaders(),
-        body: JSON.stringify({
-          message: 'cache: fingerprints',
-          content: Buffer.from(JSON.stringify(fresh), 'utf8').toString('base64'),
-          ...(sha ? { sha } : {}),
-        }),
-      });
-      console.log('[cache] fingerprints saved to GitHub');
-    } catch (e) {
-      console.log(`[cache] fingerprints save error: ${e.message}`);
-    }
-  }, 3000);
-}
-
-// Let a hash-less subtitles request briefly wait for the fingerprint request
-// that usually arrives a few seconds later, so its URLs are already correct.
-const extraWaiters = new Map(); // key -> array of resolve callbacks
-function waitForExtra(key, ms) {
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      const arr = extraWaiters.get(key) || [];
-      const i = arr.indexOf(cb);
-      if (i >= 0) arr.splice(i, 1);
-      resolve('');
-    }, ms);
-    const cb = (extra) => {
-      clearTimeout(timer);
-      resolve(extra);
-    };
-    const arr = extraWaiters.get(key) || [];
-    arr.push(cb);
-    extraWaiters.set(key, arr);
+  const family = familyFor(type, videoId);
+  // Analyze the top of the list, plus any lower-ranked file from the series'
+  // verified family (same upload batch or release-group name).
+  const pool = english.slice(0, ANALYZE_LIMIT);
+  const famTokens = family.flatMap((f) => f.tokens || []);
+  for (const s of english.slice(ANALYZE_LIMIT)) {
+    const name = `${s.movieReleaseName || ''} ${s.subtitleFileName || ''}`.toLowerCase();
+    const near = family.some((f) => Math.abs(Number(s.id) - Number(f.id)) <= 40);
+    if ((near || famTokens.some((t) => name.includes(t))) && pool.length < ANALYZE_LIMIT + 3) pool.push(s);
+  }
+  const [cands, refLoaded] = await Promise.all([
+    Promise.all(pool.map((sub, order) => loadSourceCues(sub).then((cues) => ({ sub, cues, order }), () => null))),
+    Promise.all(refs.map((sub) => loadSourceCues(sub).then((cues) => ({ sub, cues }), () => null))),
+  ]);
+  const analyzed = cands.filter(Boolean).length;
+  const plan = sync.rankSources(cands.filter(Boolean), refLoaded.filter(Boolean), {
+    userFilename: parseExtra(extra).filename || '',
+    family,
+    isReady,
+    maxVariants: MAX_VARIANTS,
   });
-}
-function notifyExtra(key, extra) {
-  (extraWaiters.get(key) || []).forEach((cb) => cb(extra));
-  extraWaiters.delete(key);
-}
-
-// --- Sticky source per series -----------------------------------------------
-// When the user manually picks a variant other than the first, remember WHICH
-// source file worked for this series and put it first from then on. The
-// fingerprint associations on OpenSubtitles are unreliable for anime releases,
-// but the user's own choice is ground truth.
-const stickyChoice = new Map(); // `${type}-${imdbBase}` -> { id, at }
-const STICKY_TTL = 90 * 24 * 3600000;
-
-function stickyKeyFor(type, videoId) {
-  return `${type}-${String(videoId).split(':')[0]}`;
-}
-function stickyIdFor(type, videoId) {
-  const s = stickyChoice.get(stickyKeyFor(type, videoId));
-  return s && Date.now() - s.at < STICKY_TTL ? s.id : '';
-}
-function applySticky(type, videoId, list) {
-  const sid = stickyIdFor(type, videoId);
-  if (!sid) return list;
-  const i = list.findIndex((c) => c.id === sid);
-  if (i <= 0) return list;
-  const out = list.slice();
-  const [pick] = out.splice(i, 1);
-  out.unshift(pick);
-  return out;
-}
-
-let stickyLoaded = false;
-async function loadStickyFromRemote() {
-  if (!GITHUB_TOKEN || stickyLoaded) return;
-  stickyLoaded = true;
-  try {
-    const r = await fetch(`https://api.github.com/repos/${CACHE_REPO}/contents/cache/sticky.json`, {
-      headers: { ...ghHeaders(), Accept: 'application/vnd.github.raw' },
-    });
-    if (!r.ok) return;
-    const obj = JSON.parse(await r.text());
-    for (const [k, v] of Object.entries(obj)) if (!stickyChoice.has(k)) stickyChoice.set(k, v);
-    console.log(`[cache] loaded ${Object.keys(obj).length} sticky choices from GitHub`);
-  } catch {
-    /* non-fatal */
+  plan.english = english;
+  plan.coverage = analyzed / pool.length;
+  if (!plan.variants.length) {
+    // Nothing could be downloaded for analysis: offer the upstream order, unverified.
+    plan.mode = 'unverified';
+    plan.variants = pool.slice(0, MAX_VARIANTS).map((sub) => ({
+      sub, rate: null, verified: false, retime: null, dub: sync.isDub(sub), hi: false, family: false, group: 0, support: 1, tokens: [], cueCount: 0,
+    }));
+    plan.all = plan.variants;
   }
+  if (type === 'series' && plan.family && plan.family.length) rememberFamily(String(videoId).split(':')[0], plan.family, videoId);
+  console.log(
+    `[plan] ${videoId} mode=${plan.mode}${plan.refNote ? ' ref=' + plan.refNote : ''}${family.length ? ' family=' + family.length : ''} ` +
+      `(${Date.now() - t0}ms, ${analyzed}/${pool.length} analyzed${plan.excluded ? ', ' + plan.excluded + ' fragments dropped' : ''}): ` +
+      plan.variants
+        .map((v, i) => `#${i + 1} ${v.sub.id}${v.rate != null ? ' ' + Math.round(v.rate * 100) + '%' : ''}${v.retime ? ' retimed' : ''}${v.family ? ' family' : ''}${v.dub ? ' dub' : ''} "${v.sub.subtitleFileName || ''}"`)
+        .join(' | ')
+  );
+  return plan;
 }
 
-let stickySaveTimer = null;
-function saveStickySoon() {
-  if (!GITHUB_TOKEN) return;
-  clearTimeout(stickySaveTimer);
-  stickySaveTimer = setTimeout(async () => {
-    try {
-      const apiUrl = `https://api.github.com/repos/${CACHE_REPO}/contents/cache/sticky.json`;
-      let sha;
-      const g = await fetch(apiUrl, { headers: ghHeaders() });
-      if (g.ok) sha = (await g.json()).sha;
-      await fetch(apiUrl, {
-        method: 'PUT',
-        headers: ghHeaders(),
-        body: JSON.stringify({
-          message: 'cache: sticky choices',
-          content: Buffer.from(JSON.stringify(Object.fromEntries(stickyChoice)), 'utf8').toString('base64'),
-          ...(sha ? { sha } : {}),
-        }),
-      });
-      console.log('[cache] sticky choices saved to GitHub');
-    } catch (e) {
-      console.log(`[cache] sticky save error: ${e.message}`);
-    }
-  }, 3000);
-}
+// ---------------------------------------------------------------------------
+// Translation jobs + cache (keyed by the English SOURCE file: the Hebrew
+// content depends only on it, so every path to that source reuses it)
+// ---------------------------------------------------------------------------
+const jobs = new Map(); // key -> { status: 'remote'|'working'|'error', why, startedAt, cueCount?, progress?, error? }
 
-function hashTag(extra) {
-  const m = /videoHash=([^&]+)/.exec(extra || '');
-  return m ? `-h${m[1].slice(0, 12)}` : '';
-}
-function cacheKeyFor(type, videoId, variant = 0, extra = '') {
-  const sid = stickyIdFor(type, videoId);
-  return `${type}-${videoId}-v${variant}${hashTag(extra)}${sid ? '-p' + String(sid).slice(0, 8) : ''}`.replace(/[^a-zA-Z0-9_-]/g, '_');
+function srcKeyFor(candId) {
+  return `src-${candId}`.replace(/[^a-zA-Z0-9_-]/g, '_');
 }
 function cachePathFor(key) {
   return path.join(CACHE_DIR, `${key}.he.srt`);
+}
+function isReady(sub) {
+  return fs.existsSync(cachePathFor(srcKeyFor(sub.id)));
+}
+
+// Older cache files carry a baked-in "Ari4KD · …" first cue; it is now added
+// when serving instead, so it can reflect the current ranking.
+function stripHeader(cues) {
+  return cues.length && /Ari4KD/.test(cues[0].text) ? cues.slice(1) : cues;
+}
+// A translation is only valid for the source it was made from: same number
+// of cues, same start times. Catches files saved under the wrong source.
+function matchesSource(heb, src) {
+  return heb.length === src.length && heb.every((c, i) => Math.abs(c.start - src[i].start) <= 5);
+}
+
+function readValidCache(key, srcCues) {
+  const file = cachePathFor(key);
+  if (!fs.existsSync(file)) return null;
+  const cues = stripHeader(sync.parseSrt(fs.readFileSync(file, 'utf8')));
+  if (matchesSource(cues, srcCues)) return cues;
+  try {
+    fs.unlinkSync(file);
+  } catch {
+    /* already gone */
+  }
+  console.log(`[${key}] cached translation does not match its English source — discarded`);
+  return null;
 }
 
 // --- Persistent cache on GitHub (survives restarts and redeploys) ---------
@@ -619,19 +563,15 @@ function ghHeaders() {
   };
 }
 
-async function loadFromRemoteCache(key) {
+async function fetchRemoteCache(key) {
   if (!GITHUB_TOKEN) return null;
   try {
-    const r = await fetch(
-      `https://api.github.com/repos/${CACHE_REPO}/contents/cache/${key}.he.srt`,
-      { headers: { ...ghHeaders(), Accept: 'application/vnd.github.raw' } }
-    );
+    const r = await fetchWithTimeout(`https://api.github.com/repos/${CACHE_REPO}/contents/cache/${key}.he.srt`, 15000, {
+      headers: { ...ghHeaders(), Accept: 'application/vnd.github.raw' },
+    });
     if (!r.ok) return null;
     const text = await r.text();
-    if (text.length < 100) return null;
-    fs.writeFileSync(cachePathFor(key), text, 'utf8');
-    console.log(`[cache] loaded ${key} from GitHub`);
-    return text;
+    return text.length < 100 ? null : text;
   } catch {
     return null;
   }
@@ -659,102 +599,312 @@ async function saveToRemoteCache(key, content) {
   }
 }
 
-// Cache is keyed by the SOURCE English subtitle id whenever possible: the
-// translated content depends only on the source file, so every path that
-// resolves to the same source (any variant, fingerprint, or preference)
-// reuses the same translation instead of re-translating.
-function srcKeyFor(candId) {
-  return `src-${candId}`.replace(/[^a-zA-Z0-9_-]/g, '_');
-}
-
-async function resolveKey(type, videoId, variant, extra) {
-  try {
-    const list = await getEnglishCandidates(type, videoId, extra);
-    if (list[variant]) return srcKeyFor(list[variant].id);
-  } catch {
-    /* fall back to the positional key */
-  }
-  return cacheKeyFor(type, videoId, variant, extra);
-}
-
-function ensureTranslation(type, videoId, variant = 0, extra = '', key = '') {
-  if (!key) key = cacheKeyFor(type, videoId, variant, extra);
-  if (fs.existsSync(cachePathFor(key))) return;
+// Start (or join) the translation of exactly this source. Never substitutes a
+// different source: if this one can't be downloaded the job fails visibly.
+function ensureTranslation(sub, why) {
+  const key = srcKeyFor(sub.id);
+  if (fs.existsSync(cachePathFor(key))) return key;
   const existing = jobs.get(key);
-  if (existing && existing.status === 'working') return;
-  // Re-attempt errored jobs after 2 minutes
-  if (existing && existing.status === 'error' && Date.now() - existing.startedAt < 120000) return;
+  if (existing && existing.status !== 'error') return key;
+  if (existing && Date.now() - existing.startedAt < 120000) return key; // recent failure: back off
 
-  jobs.set(key, { status: 'working', startedAt: Date.now() });
+  const job = { status: 'remote', why, startedAt: Date.now() };
+  jobs.set(key, job);
   const log = (msg) => console.log(`[${key}] ${msg}`);
   (async () => {
-    // If a previous instance already translated this, reuse it from GitHub.
-    if (await loadFromRemoteCache(key)) {
-      jobs.delete(key);
-      return;
+    const srcCues = await loadSourceCues(sub);
+    job.cueCount = srcCues.length;
+    // A previous server instance may already have translated this source.
+    const remote = await fetchRemoteCache(key);
+    if (remote) {
+      const cues = stripHeader(sync.parseSrt(remote));
+      if (matchesSource(cues, srcCues)) {
+        fs.writeFileSync(cachePathFor(key), sync.serializeSrt(cues), 'utf8');
+        jobs.delete(key);
+        log('loaded from GitHub cache');
+        return;
+      }
+      log('GitHub cache entry does not match its English source — re-translating');
     }
-    log('starting translation job');
-    const { cues, cand } = await fetchEnglishSrt(type, videoId, variant, extra);
-    log(`fetched English subtitles: ${cues.length} cues`);
-    const translated = await translateAll(cues, log, (done, total) => {
-      const j = jobs.get(key);
-      if (j && j.status === 'working') j.progress = { done, total, at: Date.now() };
+    job.status = 'working';
+    job.startedAt = Date.now();
+    log(`translating ${srcCues.length} cues (${why}) from "${sub.subtitleFileName || sub.id}"`);
+    const texts = await translateAll(srcCues, log, (done, total) => {
+      job.progress = { done, total, at: Date.now() };
     });
-    // Identification cue: shown during the first seconds of playback so the
-    // user knows which variant they picked and whether it is file-verified.
-    const idLabel = `Ari4KD · גרסה ${variant + 1}${cand && cand.hashMatch ? ' · ✓ מסונכרן לקובץ' : ''}`;
-    cues.unshift({ timing: '00:00:00,500 --> 00:00:05,000', text: idLabel });
-    translated.unshift(idLabel);
-    const srt = buildSrt(cues, translated);
+    const srt = sync.serializeSrt(
+      srcCues.map((c, i) => ({ start: c.start, end: c.end, text: sync.rtl((texts[i] || c.text).trim()) }))
+    );
     fs.writeFileSync(cachePathFor(key), srt, 'utf8');
     jobs.delete(key);
-    log('done — Hebrew subtitles cached');
+    log(`done in ${Math.round((Date.now() - job.startedAt) / 1000)}s — Hebrew subtitles cached`);
     await saveToRemoteCache(key, srt); // persist across restarts/redeploys
   })().catch((e) => {
     console.error(`[${key}] FAILED: ${e.message}`);
-    jobs.set(key, { status: 'error', error: e.message, startedAt: Date.now() });
+    jobs.set(key, { status: 'error', error: e.message, why, startedAt: Date.now() });
   });
+  return key;
 }
 
 // Hold a subtitle request open until the translation job finishes (or maxMs
-// elapses). Stremio downloads the .srt exactly once per selection, so serving
-// the real file inside that first response removes the "re-select" dance.
-async function waitForTranslation(key, maxMs) {
+// elapses). Stremio's streaming server waits for add-on subtitles without a
+// response timeout, so serving the real file inside the first response means
+// no re-selecting is needed.
+async function waitForTranslation(key, maxMs, isGone = () => false) {
   const deadline = Date.now() + maxMs;
   while (Date.now() < deadline) {
     if (fs.existsSync(cachePathFor(key))) return 'done';
     const job = jobs.get(key);
     if (job && job.status === 'error') return 'error';
-    await new Promise((r) => setTimeout(r, 1500));
+    if (isGone()) return 'gone';
+    await sleep(1000);
   }
   return 'timeout';
 }
 
-// Human-readable ETA for the fallback placeholder, based on batch progress.
-function etaText(job) {
-  const p = job && job.progress;
-  if (!p || !p.done) return '';
-  const elapsed = (Date.now() - job.startedAt) / 1000;
-  const remaining = Math.max(5, Math.round((elapsed / p.done) * (p.total - p.done)));
-  return ` | ${p.done}/${p.total} הושלמו, עוד ~${remaining} שניות | ${p.done}/${p.total} done, ~${remaining}s left`;
+// Brief wait while a job only checks the GitHub cache (~1s), so the menu can
+// already say "ready" for anything translated before.
+async function waitWhileCheckingCache(key, maxMs) {
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline && jobs.get(key) && jobs.get(key).status === 'remote') await sleep(250);
 }
 
-function placeholderSrt(message) {
-  const lines = [];
-  let n = 1;
-  const fmt = (totalSec) => {
-    const h = String(Math.floor(totalSec / 3600)).padStart(2, '0');
-    const m = String(Math.floor((totalSec % 3600) / 60)).padStart(2, '0');
-    const s = String(totalSec % 60).padStart(2, '0');
-    return `${h}:${m}:${s},000`;
-  };
-  for (let t = 0; t < 600; t += 15) {
-    lines.push(String(n++));
-    lines.push(`${fmt(t)} --> ${fmt(t + 8)}`);
-    lines.push(message);
-    lines.push('');
+function estimateSeconds(cueCount) {
+  const batches = Math.max(1, Math.ceil((cueCount || 350) / BATCH_SIZE));
+  return 10 + Math.ceil(batches / Math.max(1, CONCURRENCY)) * 20;
+}
+function remainingSeconds(key, cueCount) {
+  const job = jobs.get(key);
+  if (!job) return estimateSeconds(cueCount);
+  const elapsed = (Date.now() - job.startedAt) / 1000;
+  const p = job.progress;
+  if (p && p.done) return Math.round((elapsed / p.done) * (p.total - p.done));
+  const est = estimateSeconds(job.cueCount || cueCount);
+  return elapsed < est ? est - elapsed : 15; // slower than usual: "a little longer"
+}
+const roundUp5 = (s) => Math.max(5, Math.ceil(s / 5) * 5);
+
+// ---------------------------------------------------------------------------
+// What the user sees: menu labels, first-seconds banner, placeholders
+// ---------------------------------------------------------------------------
+function statusText(v) {
+  if (isReady(v.sub)) return '✓ מוכן';
+  const key = srcKeyFor(v.sub.id);
+  const job = jobs.get(key);
+  if (job && job.status === 'error') return '⚠️ שגיאה בתרגום';
+  const secs = roundUp5(remainingSeconds(key, v.cueCount));
+  return job ? `⏳ בתרגום, מוכן בעוד ~${secs} שנ׳` : `⏳ ~${secs} שנ׳ לתרגום`;
+}
+
+// Shown as the option's name in Stremio's subtitle menu.
+function variantLabel(v, i) {
+  const parts = [i === 0 ? '⭐ מומלץ' : `חלופה ${i + 1}`];
+  if (v.verified) parts.push('מסונכרן לקובץ שלך');
+  else if (i === 0 && v.rate != null) parts.push('הכי קרוב לקובץ שלך');
+  else if (i > 0) parts.push('תזמון שונה');
+  const tag = sync.sourceTag(v.sub);
+  if (i > 0 && tag) parts.push(tag);
+  if (v.dub) parts.push('תמלול דיבוב');
+  parts.push(statusText(v));
+  return parts.join(' · ');
+}
+
+// Shown on screen during the first seconds of playback.
+function bannerText(v, slot) {
+  const parts = ['Ari4KD', slot === 0 ? '⭐ מומלץ' : slot > 0 ? `חלופה ${slot + 1}` : ''];
+  if (v.verified) parts.push('מסונכרן לקובץ שלך');
+  else if (v.retime) parts.push('תוזמן מחדש');
+  return parts.filter(Boolean).join(' · ');
+}
+
+function renderForPlayer(cues, v, slot) {
+  const out = sync.applyRetime(cues, v.retime).slice();
+  const first = out.length ? out[0].start : Infinity;
+  if (first >= 1500) out.unshift({ start: 500, end: Math.min(5000, first - 100), text: sync.rtl(bannerText(v, slot)) });
+  return sync.serializeSrt(out);
+}
+
+function placeholderSrt(...lines) {
+  const text = lines.map((l) => (/[֐-׿]/.test(l) ? sync.rtl(l) : l)).join('\n');
+  const cues = [];
+  for (let t = 0; t < 600; t += 15) cues.push({ start: t * 1000, end: (t + 8) * 1000, text });
+  return sync.serializeSrt(cues);
+}
+
+// ---------------------------------------------------------------------------
+// Fingerprint memory
+// ---------------------------------------------------------------------------
+// Stremio often asks for subtitles BEFORE it knows the video's fingerprint,
+// then again WITH it seconds later — but the player may keep using the first
+// response's URLs. Remember the latest fingerprint per video so every request
+// is served the exact-matched (perfectly synced) file regardless of ordering.
+const lastExtra = new Map(); // `${type}-${videoId}` -> { extra, at }
+const LAST_EXTRA_TTL = 6 * 3600000;
+
+function rememberedExtra(type, videoId) {
+  const stored = lastExtra.get(`${type}-${videoId}`);
+  return stored && Date.now() - stored.at < LAST_EXTRA_TTL ? stored.extra : '';
+}
+
+// Small JSON state files in the cache repo. Fingerprints and verified
+// families must survive instance restarts (Render free churns instances, and
+// the player's request often lands on a freshly-woken server).
+async function loadRepoJson(file) {
+  if (!GITHUB_TOKEN) return null;
+  try {
+    const r = await fetchWithTimeout(`https://api.github.com/repos/${CACHE_REPO}/contents/cache/${file}`, 10000, {
+      headers: { ...ghHeaders(), Accept: 'application/vnd.github.raw' },
+    });
+    return r.ok ? JSON.parse(await r.text()) : null;
+  } catch {
+    return null;
   }
-  return lines.join('\n');
+}
+
+const repoSaveTimers = new Map();
+function saveRepoJsonSoon(file, build, message) {
+  if (!GITHUB_TOKEN) return;
+  clearTimeout(repoSaveTimers.get(file));
+  repoSaveTimers.set(
+    file,
+    setTimeout(async () => {
+      try {
+        const apiUrl = `https://api.github.com/repos/${CACHE_REPO}/contents/cache/${file}`;
+        let sha;
+        const g = await fetch(apiUrl, { headers: ghHeaders() });
+        if (g.ok) sha = (await g.json()).sha;
+        const res = await fetch(apiUrl, {
+          method: 'PUT',
+          headers: ghHeaders(),
+          body: JSON.stringify({
+            message,
+            content: Buffer.from(JSON.stringify(build()), 'utf8').toString('base64'),
+            ...(sha ? { sha } : {}),
+          }),
+        });
+        console.log(res.ok ? `[cache] ${file} saved to GitHub` : `[cache] ${file} save failed (${res.status})`);
+      } catch (e) {
+        console.log(`[cache] ${file} save error: ${e.message}`);
+      }
+    }, 3000)
+  );
+}
+
+let stateLoading = null;
+function loadStateFromRemote() {
+  if (!stateLoading) {
+    stateLoading = (async () => {
+      const [extras, series] = await Promise.all([loadRepoJson('extras.json'), loadRepoJson('series.json')]);
+      if (extras) {
+        for (const [k, v] of Object.entries(extras)) if (!lastExtra.has(k)) lastExtra.set(k, v);
+        console.log(`[cache] loaded ${Object.keys(extras).length} fingerprints from GitHub`);
+      }
+      if (series) {
+        for (const [k, v] of Object.entries(series)) if (!seriesFamily.has(k)) seriesFamily.set(k, v);
+        console.log(`[cache] loaded ${Object.keys(series).length} series timing families from GitHub`);
+      }
+    })();
+  }
+  return stateLoading;
+}
+
+function saveExtrasSoon() {
+  saveRepoJsonSoon(
+    'extras.json',
+    () => {
+      const fresh = {};
+      for (const [k, v] of lastExtra) if (Date.now() - v.at < LAST_EXTRA_TTL) fresh[k] = v;
+      return fresh;
+    },
+    'cache: fingerprints'
+  );
+}
+
+// Families from several verified episodes accumulate (newest first), so a
+// release name seen on one episode keeps helping on the others.
+function rememberFamily(imdb, members, episode) {
+  const prev = seriesFamily.get(imdb);
+  const merged = members.slice();
+  const older = prev && Date.now() - prev.at < FAMILY_TTL ? prev.members : [];
+  for (const m of older) if (!merged.some((x) => x.id === m.id)) merged.push(m);
+  merged.splice(12);
+  const ids = (list) => list.map((m) => m.id).sort().join();
+  const same = prev && ids(prev.members) === ids(merged);
+  seriesFamily.set(imdb, { members: merged, at: Date.now(), episode });
+  if (same) return;
+  console.log(`[family] ${imdb}: verified on ${episode} -> ${members.map((m) => m.id + (m.tokens.length ? ' (' + m.tokens.join(',') + ')' : '')).join(', ')} (${merged.length} known)`);
+  saveRepoJsonSoon(
+    'series.json',
+    () => {
+      const fresh = {};
+      for (const [k, v] of seriesFamily) if (Date.now() - v.at < FAMILY_TTL) fresh[k] = v;
+      return fresh;
+    },
+    'cache: series timing families'
+  );
+}
+
+// Let a hash-less subtitles request briefly wait for the fingerprint request
+// that usually arrives a few seconds later, so its URLs are already correct.
+const extraWaiters = new Map(); // key -> array of resolve callbacks
+function waitForExtra(key, ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      const arr = extraWaiters.get(key) || [];
+      const i = arr.indexOf(cb);
+      if (i >= 0) arr.splice(i, 1);
+      resolve('');
+    }, ms);
+    const cb = (extra) => {
+      clearTimeout(timer);
+      resolve(extra);
+    };
+    const arr = extraWaiters.get(key) || [];
+    arr.push(cb);
+    extraWaiters.set(key, arr);
+  });
+}
+function notifyExtra(key, extra) {
+  (extraWaiters.get(key) || []).forEach((cb) => cb(extra));
+  extraWaiters.delete(key);
+}
+
+// ---------------------------------------------------------------------------
+// Next episode, translated ahead of time
+// ---------------------------------------------------------------------------
+const prefetched = new Map(); // videoId -> at
+
+function schedulePrefetch(type, videoId) {
+  if (!PREFETCH_NEXT || type !== 'series') return;
+  const m = /^(tt\d+):(\d+):(\d+)$/.exec(videoId);
+  if (!m) return;
+  const next = `${m[1]}:${m[2]}:${Number(m[3]) + 1}`;
+  const nextSeason = `${m[1]}:${Number(m[2]) + 1}:1`;
+  const seen = prefetched.get(next);
+  if (seen && Date.now() - seen < 6 * 3600000) return;
+  prefetched.set(next, Date.now());
+  pruneMap(prefetched, 200);
+
+  let tries = 0;
+  const attempt = async () => {
+    // Let the episode being watched translate first.
+    const busy = [...jobs.values()].some((j) => j.status !== 'error' && j.why !== 'prefetch');
+    if (busy && ++tries < 40) return void setTimeout(attempt, 15000);
+    for (const nid of [next, nextSeason]) {
+      try {
+        const plan = await getPlan(type, nid, '');
+        const v = plan.variants[0];
+        if (!v) continue;
+        if (isReady(v.sub)) return void console.log(`[prefetch] ${nid} already translated`);
+        console.log(`[prefetch] ${nid} -> ${v.sub.id} "${v.sub.subtitleFileName || ''}"`);
+        ensureTranslation(v.sub, 'prefetch');
+        return;
+      } catch (e) {
+        console.log(`[prefetch] ${nid} skipped: ${e.message}`);
+      }
+    }
+  };
+  setTimeout(attempt, 5000);
 }
 
 // ---------------------------------------------------------------------------
@@ -766,9 +916,9 @@ app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', '*');
   // Diagnostic: log every subtitle request so we can see exactly what
-  // Stremio sends (videoHash / videoSize / filename presence).
+  // Stremio sends (videoHash / videoSize / filename presence) and from where.
   if (req.path.startsWith('/subtitles/') || req.path.startsWith('/subfile/')) {
-    console.log(`[request] ${req.originalUrl}`);
+    console.log(`[request] ${req.originalUrl} ua="${String(req.headers['user-agent'] || '').slice(0, 60)}"`);
   }
   next();
 });
@@ -777,6 +927,7 @@ function baseUrl(req) {
   const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
   return `${proto}://${req.headers.host}`;
 }
+const safeId = (s) => String(s).replace(/[^a-zA-Z0-9_-]/g, '_');
 
 app.get('/manifest.json', (req, res) => {
   res.json(MANIFEST);
@@ -787,10 +938,7 @@ async function handleSubtitlesRequest(req, res) {
   if (!['movie', 'series'].includes(type) || !id.startsWith('tt')) {
     return res.json({ subtitles: [] });
   }
-  // Stremio sends the exact video file's fingerprint (videoHash) — use it so
-  // the first Hebrew option is translated from a perfectly-synced English file.
-  await loadExtrasFromRemote();
-  await loadStickyFromRemote();
+  await loadStateFromRemote();
   let extra = req.params.extra && req.params.extra.includes('videoHash=') ? req.params.extra : '';
   const exKey = `${type}-${id}`;
   if (extra) {
@@ -802,41 +950,40 @@ async function handleSubtitlesRequest(req, res) {
     if (!extra) extra = await waitForExtra(exKey, 8000); // it usually arrives seconds later
     if (!extra) extra = rememberedExtra(type, id);
   }
-  // Only translate eagerly once the fingerprint is known — translating the
-  // hash-less request that arrives first produced unsynced "variant 1" files.
-  // Without a fingerprint, translation starts when the user selects the sub.
-  if (extra) {
-    resolveKey(type, id, 0, extra).then((k) => ensureTranslation(type, id, 0, extra, k));
-  }
-
-  // Offer up to 3 Hebrew variants (each from a different English source file),
-  // labeled with a timing validation so the user can pick the right one:
-  //  - "מסונכרן" = matched to the exact video file by fingerprint (certain)
-  //  - the end-time (e.g. 23:20) = compare with the episode length in the player
-  //  - "✓" = at least two independent sources agree on this timing
-  let cands = [];
-  try {
-    cands = (await getEnglishCandidates(type, id, extra)).slice(0, 3);
-  } catch {
-    /* fall back to a single entry */
-  }
-  const variants = Math.max(1, cands.length);
-
-  // All entries use lang "heb" so they group under the Hebrew language
-  // category in Stremio (per-variant custom labels are not supported by the
-  // subtitles object — only id/url/lang). Each file identifies itself with an
-  // "Ari4KD · גרסה N" cue during the first seconds of playback, including a
-  // "✓ מסונכרן לקובץ" marker when it was matched to the exact video file.
   const xq = extra ? `&x=${encodeURIComponent(extra)}` : '';
-  const subtitles = [];
-  for (let v = 0; v < variants; v++) {
-    subtitles.push({
-      id: `heb-ai-${cacheKeyFor(type, id, v, extra)}`,
-      url: `${baseUrl(req)}/subfile/${type}/${encodeURIComponent(id)}/v${v}.srt?b=5${xq}`,
-      lang: 'heb',
+
+  let plan;
+  try {
+    plan = await getPlan(type, id, extra);
+  } catch (e) {
+    console.log(`[plan] ${id} failed: ${e.message}`);
+    return res.json({
+      subtitles: [{
+        id: `heb-ai-${safeId(id)}-retry`,
+        url: `${baseUrl(req)}/subfile/${type}/${encodeURIComponent(id)}/v0.srt?b=6${xq}`,
+        lang: 'heb',
+        label: '⚠️ שגיאה זמנית בחיפוש כתוביות',
+      }],
+      cacheMaxAge: 0,
     });
   }
-  res.json({ subtitles, cacheMaxAge: 3600 });
+  if (!plan.variants.length) return res.json({ subtitles: [], cacheMaxAge: 600 });
+
+  // Start translating the recommended option right away, so it is ready (or
+  // nearly) by the time it's selected; then the next episode in the background.
+  const key = ensureTranslation(plan.variants[0].sub, 'eager');
+  await waitWhileCheckingCache(key, 3000);
+  schedulePrefetch(type, id);
+
+  // Each option addresses its source file directly (".../s<sourceId>.srt"), so
+  // the file served always matches the label, even if the ranking changes.
+  const subtitles = plan.variants.map((v, i) => ({
+    id: `heb-ai-${safeId(id)}-${safeId(v.sub.id)}`,
+    url: `${baseUrl(req)}/subfile/${type}/${encodeURIComponent(id)}/s${encodeURIComponent(v.sub.id)}.srt?b=6${xq}${isReady(v.sub) ? '&r=1' : ''}`,
+    lang: 'heb',
+    label: variantLabel(v, i),
+  }));
+  res.json({ subtitles, cacheMaxAge: 60 });
 }
 
 app.get('/subtitles/:type/:id.json', handleSubtitlesRequest);
@@ -844,70 +991,121 @@ app.get('/subtitles/:type/:id/:extra.json', handleSubtitlesRequest);
 
 async function handleSubfileRequest(req, res) {
   const { type, id } = req.params;
-  const variant = parseInt(String(req.params.variant || '0').replace(/\D/g, ''), 10) || 0;
-  await loadExtrasFromRemote();
-  await loadStickyFromRemote();
+  const sel = String(req.params.variant || 'v0');
+  await loadStateFromRemote();
   let extra = typeof req.query.x === 'string' && req.query.x.includes('videoHash=') ? req.query.x : '';
   if (!extra) extra = rememberedExtra(type, id); // fall back to the remembered fingerprint
   if (!extra) extra = await waitForExtra(`${type}-${id}`, 5000); // fingerprint may arrive any second
-
-  // Picking a non-first variant is a deliberate user choice: remember which
-  // SOURCE that is and put it first for every future episode of this series.
-  if (variant > 0) {
-    getEnglishCandidates(type, id, extra)
-      .then((list) => {
-        const cand = list[variant];
-        if (cand && stickyIdFor(type, id) !== cand.id) {
-          stickyChoice.set(stickyKeyFor(type, id), { id: cand.id, at: Date.now() });
-          saveStickySoon();
-          console.log(`[sticky] ${stickyKeyFor(type, id)} -> source ${cand.id} (was variant ${variant + 1})`);
-        }
-      })
-      .catch(() => {});
-  }
-  const key = await resolveKey(type, id, variant, extra);
-  const file = cachePathFor(key);
   res.setHeader('Content-Type', 'text/srt; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
 
-  // Short client cache so a re-selected variant picks up corrected files
-  // (e.g. right after the fingerprint registers) instead of a stale copy.
-  if (fs.existsSync(file)) {
-    res.setHeader('Cache-Control', 'public, max-age=300');
-    return res.send(fs.readFileSync(file, 'utf8'));
+  let plan;
+  try {
+    plan = await getPlan(type, id, extra);
+  } catch (e) {
+    return res.send(placeholderSrt('⚠️ שגיאה זמנית בחיפוש כתוביות — נסו שוב בעוד רגע', `Subtitle search failed: ${e.message}`));
   }
 
-  // Not on local disk — maybe a previous server instance translated it.
-  const remote = await loadFromRemoteCache(key);
-  if (remote) {
-    res.setHeader('Cache-Control', 'public, max-age=300');
-    return res.send(remote);
+  // "s<sourceId>" = a specific source; "v<n>" = the n-th option (older URLs).
+  let slot = -1;
+  let v = null;
+  if (sel.startsWith('s')) {
+    const sid = sel.slice(1);
+    slot = plan.variants.findIndex((x) => String(x.sub.id) === sid);
+    v = slot >= 0 ? plan.variants[slot] : plan.all.find((x) => String(x.sub.id) === sid);
+    if (!v) {
+      const sub = (plan.english || []).find((s) => String(s.id) === sid);
+      if (sub) v = { sub, rate: null, verified: false, retime: null, dub: sync.isDub(sub), cueCount: 0 };
+    }
+  } else {
+    slot = Math.min(parseInt(sel.replace(/\D/g, ''), 10) || 0, Math.max(0, plan.variants.length - 1));
+    v = plan.variants[slot];
+  }
+  if (!v) return res.send(placeholderSrt('לא נמצאו כתוביות באנגלית לתרגום עבור הקובץ הזה', 'No English subtitles found for this video'));
+
+  const key = srcKeyFor(v.sub.id);
+  let srcCues;
+  try {
+    srcCues = await loadSourceCues(v.sub);
+  } catch (e) {
+    return res.send(placeholderSrt('⚠️ לא ניתן להוריד את כתוביות המקור — בחרו חלופה אחרת', `Source download failed: ${e.message}`));
   }
 
-  ensureTranslation(type, id, variant, extra, key);
-
-  // Hold the request open so the player receives the real Hebrew file in this
-  // same response — no re-select needed. Render's proxy allows ~100s, so a
-  // 55s hold is safe; most jobs finish well within it.
-  const outcome = await waitForTranslation(key, SUBFILE_HOLD_MS);
-  if (outcome === 'done') {
-    res.setHeader('Cache-Control', 'public, max-age=300');
-    return res.send(fs.readFileSync(cachePathFor(key), 'utf8'));
+  let cues = readValidCache(key, srcCues);
+  if (!cues) {
+    ensureTranslation(v.sub, 'selected');
+    // Hold the request open so the player receives the real Hebrew file in
+    // this same response — the subtitles simply appear when ready.
+    const started = Date.now();
+    let gone = false;
+    res.on('close', () => {
+      if (!res.writableFinished) gone = true;
+    });
+    const outcome = await waitForTranslation(key, SUBFILE_HOLD_MS, () => gone);
+    const waited = Math.round((Date.now() - started) / 1000);
+    if (gone) return void console.log(`[hold] ${key}: player stopped waiting after ${waited}s`);
+    console.log(`[hold] ${key}: ${outcome} after ${waited}s`);
+    if (outcome === 'done') cues = readValidCache(key, srcCues);
   }
+  if (cues) return res.send(renderForPlayer(cues, v, slot));
 
   const job = jobs.get(key);
-  res.setHeader('Cache-Control', 'no-store');
-  if (outcome === 'error' || (job && job.status === 'error')) {
-    return res.send(placeholderSrt(`שגיאה בתרגום: ${job && job.error} | Translation error`));
+  if (job && job.status === 'error') {
+    return res.send(placeholderSrt('⚠️ שגיאה בתרגום — בחרו חלופה אחרת או נסו שוב בעוד 2 דקות', `Translation error: ${job.error}`));
   }
+  const secs = roundUp5(remainingSeconds(key, srcCues.length));
+  const p = job && job.progress;
   return res.send(
     placeholderSrt(
-      `התרגום לעברית עדיין בהכנה — בחרו שוב את הכתוביות${etaText(job)} | Still translating — re-select subtitles`
+      `⏳ התרגום עדיין בהכנה${p ? ` (${p.done}/${p.total})` : ''} — מוכן בעוד ~${secs} שנ׳`,
+      `סגרו את הנגן ופתחו שוב בעוד ~${secs} שנ׳ והכתוביות ייטענו מיד`
     )
   );
 }
 
 app.get('/subfile/:type/:id/:variant.srt', handleSubfileRequest);
 app.get('/subfile/:type/:id.srt', handleSubfileRequest);
+
+// Diagnostics: which sources would be offered for a video, and why.
+// /debug/plan/series/tt2560140:2:5.json?x=<fingerprint extra>
+app.get('/debug/plan/:type/:id.json', async (req, res) => {
+  const extra = typeof req.query.x === 'string' ? req.query.x : '';
+  try {
+    await loadStateFromRemote();
+    const plan = await getPlan(req.params.type, req.params.id, extra);
+    const view = (v, i) => ({
+      id: v.sub.id,
+      file: v.sub.subtitleFileName,
+      group: v.group,
+      match: v.rate == null ? null : Math.round(v.rate * 1000) / 10,
+      verified: v.verified,
+      family: v.family,
+      retime: v.retime ? (v.retime.offsets ? 'piecewise' : { scale: v.retime.scale, offsetMs: v.retime.offset }) : null,
+      dub: v.dub,
+      hi: v.hi,
+      ready: isReady(v.sub),
+      ...(i != null ? { label: variantLabel(v, i) } : {}),
+    });
+    res.json({
+      mode: plan.mode,
+      reference: plan.refNote,
+      coverage: plan.coverage,
+      fragmentsDropped: plan.excluded || 0,
+      variants: plan.variants.map((v, i) => view(v, i)),
+      analyzed: plan.all.map((v) => view(v)),
+      seriesFamily: seriesFamily.get(String(req.params.id).split(':')[0]) || null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Diagnostics: how long the hosting proxy lets a request stay open.
+app.get('/debug/hold', async (req, res) => {
+  const secs = Math.min(300, Math.max(1, Number(req.query.s) || 10));
+  await sleep(secs * 1000);
+  res.send(`held ${secs}s`);
+});
 
 app.get('/health', (req, res) => res.send('ok'));
 
